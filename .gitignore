@@ -1,0 +1,5 @@
+graphify-out/
+*.log
+*.tmp
+.env
+.env.*
