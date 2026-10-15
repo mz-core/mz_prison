@@ -128,7 +128,10 @@ local function releaseSentence(sentence, actor, operationId, requestFingerprint,
 end
 
 function Service.requestSentence(actorSource, targetSource, request)
-  if not closed(request, { ruleCode = true, caseId = true, operationId = true, orgCode = true }) then
+  if not closed(request, {
+    chargeId = true, ruleCode = true, ruleName = true, sentenceSeconds = true,
+    legalVersion = true, caseId = true, operationId = true, orgCode = true
+  }) then
     return false, 'invalid_request'
   end
   if MZPrisonConfig.intakeEnabled ~= true or type(MZPrisonConfig.intakePoints) ~= 'table'
@@ -142,14 +145,27 @@ function Service.requestSentence(actorSource, targetSource, request)
   if not atPoint then return false, pointError end
   local orgCode = token(request.orgCode, 2, 64, '^[a-z0-9_-]+$')
   local caseId = token(request.caseId, 8, 160)
+  local chargeId = token(request.chargeId, 8, 160)
   local operationId = token(request.operationId, 16, 64, '^[%w_-]+$')
-  if not orgCode or not caseId or not operationId then return false, 'invalid_request' end
+  local ruleName = trim(request.ruleName)
+  local legalVersion = trim(request.legalVersion)
+  local sentenceSeconds = tonumber(request.sentenceSeconds)
+  sentenceSeconds = sentenceSeconds and math.floor(sentenceSeconds) or nil
+  if not orgCode or not caseId or not chargeId or not operationId or ruleName == ''
+    or #ruleName > 160 or legalVersion == '' or #legalVersion > 64
+    or not sentenceSeconds or sentenceSeconds <= 0 then
+    return false, 'invalid_request'
+  end
   local sentenceRule, ruleError = rule('sentenceRules', orgCode, request.ruleCode)
   if not sentenceRule then return false, ruleError end
+  if sentenceRule.name ~= ruleName or sentenceRule.seconds ~= sentenceSeconds
+    or tostring(MZPrisonConfig.legalVersion or '') ~= legalVersion then
+    return false, 'sentence_rule_mismatch'
+  end
   if MZPrisonConfig.clockMode ~= 'online' then return false, 'clock_mode_not_supported' end
   local requestFingerprint = fingerprint(
     actor.citizenid, target.citizenid, orgCode, caseId,
-    sentenceRule.code, sentenceRule.seconds, MZPrisonConfig.legalVersion
+    chargeId, sentenceRule.code, sentenceSeconds, legalVersion
   )
   local publicId = 'sentence:' .. operationId
 
@@ -163,13 +179,14 @@ function Service.requestSentence(actorSource, targetSource, request)
       if MZPrison.Repository.getCurrent(target.citizenid) then return false, 'active_sentence_exists' end
       local created = MZPrison.Repository.createSentence({
         publicId = publicId, operationId = operationId, targetCitizenid = target.citizenid,
-        caseId = caseId, orgCode = orgCode, ruleCode = sentenceRule.code, ruleName = sentenceRule.name,
-        legalVersion = MZPrisonConfig.legalVersion, durationSeconds = sentenceRule.seconds,
+        caseId = caseId, chargeId = chargeId, orgCode = orgCode,
+        ruleCode = sentenceRule.code, ruleName = ruleName,
+        legalVersion = legalVersion, durationSeconds = sentenceSeconds,
         clockMode = MZPrisonConfig.clockMode, actorCitizenid = actor.citizenid,
         history = {
           operationId = operationId, requestFingerprint = requestFingerprint,
           sentenceId = publicId, action = 'sentence_created', actorCitizenid = actor.citizenid,
-          details = { ruleCode = sentenceRule.code, durationSeconds = sentenceRule.seconds }
+          details = { chargeId = chargeId, ruleCode = sentenceRule.code, durationSeconds = sentenceSeconds }
         }
       })
       if not created then return false, 'persistence_failed' end

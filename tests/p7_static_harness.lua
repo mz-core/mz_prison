@@ -16,9 +16,12 @@ expect(service:find('intake_point_required', 1, true), 'proximidade do intake na
 expect(config:find('sentenceRulesEnabled = false', 1, true), 'penas foram ativadas sem aprovacao')
 expect(config:find('sentenceRules = {}', 1, true) and config:find('jobs = {}', 1, true), 'valores legais foram inventados')
 expect(prepare:find('mz_prison_sentences', 1, true) and prepare:find('mz_prison_property', 1, true), 'schema prisional incompleto')
+expect(prepare:find('charge_public_id VARCHAR(160) NOT NULL', 1, true), 'schema nao persiste identificador canonico da acusacao P6')
+expect(prepare:find('schema_outdated_missing_charge_public_id', 1, true), 'schema legado nao falha fechado')
 expect(service:find("clockMode = MZPrisonConfig.clockMode", 1, true), 'clock server-side ausente')
 expect(not service:find('request.duration', 1, true) and not service:find('request.durationSeconds', 1, true), 'duracao do client foi aceita')
+expect(service:find("return false, 'sentence_rule_mismatch'", 1, true), 'snapshot legal P6 nao e confrontado com a configuracao P7')
 expect(exportsSource:find("GetInvokingResource() == 'mz_police'", 1, true), 'caller policial nao esta allowlisted')
 expect(not service:find('RegisterNetEvent', 1, true), 'mutacao prisional exposta diretamente ao client')
 
-print('mz_prison P7 static harness: PASS cases=11')
+print('mz_prison P7 static harness: PASS cases=14')

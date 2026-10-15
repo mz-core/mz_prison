@@ -45,12 +45,12 @@ end
 function Repository.createSentence(data)
   return transaction({ {
     query = [[INSERT INTO mz_prison_sentences
-      (public_id, operation_id, target_citizenid, case_public_id, org_code, rule_code,
+      (public_id, operation_id, target_citizenid, case_public_id, charge_public_id, org_code, rule_code,
        rule_name, legal_version, duration_seconds, remaining_seconds, clock_mode,
        status, property_status, sentenced_by_citizenid)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intake_pending', 'pending', ?)]],
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intake_pending', 'pending', ?)]],
     parameters = {
-      data.publicId, data.operationId, data.targetCitizenid, data.caseId, data.orgCode,
+      data.publicId, data.operationId, data.targetCitizenid, data.caseId, data.chargeId, data.orgCode,
       data.ruleCode, data.ruleName, data.legalVersion, data.durationSeconds,
       data.durationSeconds, data.clockMode, data.actorCitizenid
     }

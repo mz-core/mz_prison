@@ -55,7 +55,9 @@ MZPrison.Repository = {
     local row = {
       public_id = data.publicId, operation_id = data.operationId,
       target_citizenid = data.targetCitizenid, case_public_id = data.caseId,
+      charge_public_id = data.chargeId,
       org_code = data.orgCode, rule_code = data.ruleCode, rule_name = data.ruleName,
+      legal_version = data.legalVersion,
       duration_seconds = data.durationSeconds, remaining_seconds = data.durationSeconds,
       status = 'intake_pending', property_status = 'pending'
     }
@@ -104,7 +106,11 @@ MZPrison.Repository = {
 
 dofile('server/service.lua')
 
-local request = { ruleCode = 'custodial', caseId = 'case:0001', operationId = 'sentence_request_001', orgCode = 'police' }
+local request = {
+  chargeId = 'charge:0001', ruleCode = 'custodial', ruleName = 'Custodial',
+  sentenceSeconds = 120, legalVersion = 'test-v1', caseId = 'case:0001',
+  operationId = 'sentence_request_001', orgCode = 'police'
+}
 local disabledOk, disabledError = MZPrison.Service.requestSentence(1, 2, request)
 expect(disabledOk == false and disabledError == 'intake_not_configured', 'intake sem coordenadas foi aceito')
 
@@ -118,10 +124,18 @@ expect(rulesOk == false and rulesError == 'rules_disabled', 'regra de sentenca d
 MZPrisonConfig.sentenceRulesEnabled = true
 
 local invalidOk, invalidError = MZPrison.Service.requestSentence(1, 2, {
-  ruleCode = 'custodial', caseId = 'case:0001', operationId = 'sentence_request_002',
-  orgCode = 'police', durationSeconds = 1
+  chargeId = 'charge:0001', ruleCode = 'custodial', ruleName = 'Custodial',
+  sentenceSeconds = 120, legalVersion = 'test-v1', caseId = 'case:0001',
+  operationId = 'sentence_request_002', orgCode = 'police', durationSeconds = 1
 })
 expect(invalidOk == false and invalidError == 'invalid_request', 'duracao client-authoritative foi aceita')
+
+local mismatchOk, mismatchError = MZPrison.Service.requestSentence(1, 2, {
+  chargeId = 'charge:0001', ruleCode = 'custodial', ruleName = 'Custodial',
+  sentenceSeconds = 1, legalVersion = 'test-v1', caseId = 'case:0001',
+  operationId = 'sentence_request_002', orgCode = 'police'
+})
+expect(mismatchOk == false and mismatchError == 'sentence_rule_mismatch', 'snapshot P6 divergente foi aceito')
 
 local createdOk, sentence = MZPrison.Service.requestSentence(1, 2, request)
 expect(createdOk == true and sentence.status == 'active' and sentence.remaining_seconds == 120
@@ -130,7 +144,9 @@ local replayOk = MZPrison.Service.requestSentence(1, 2, request)
 expect(replayOk == true and retainCalls == 1, 'replay repetiu retencao')
 
 local duplicateOk, duplicateError = MZPrison.Service.requestSentence(1, 2, {
-  ruleCode = 'custodial', caseId = 'case:0002', operationId = 'sentence_request_003', orgCode = 'police'
+  chargeId = 'charge:0002', ruleCode = 'custodial', ruleName = 'Custodial',
+  sentenceSeconds = 120, legalVersion = 'test-v1', caseId = 'case:0002',
+  operationId = 'sentence_request_003', orgCode = 'police'
 })
 expect(duplicateOk == false and duplicateError == 'active_sentence_exists', 'segunda sentenca ativa foi aceita')
 
@@ -153,7 +169,11 @@ local manualOk, manualError = MZPrison.Service.releasePrisoner(1, 'TARGET1', {
 })
 expect(manualOk == false and manualError == 'manual_release_disabled', 'soltura manual desabilitada foi aceita')
 
-local target2Request = { ruleCode = 'custodial', caseId = 'case:0002', operationId = 'sentence_request_004', orgCode = 'police' }
+local target2Request = {
+  chargeId = 'charge:0002', ruleCode = 'custodial', ruleName = 'Custodial',
+  sentenceSeconds = 120, legalVersion = 'test-v1', caseId = 'case:0002',
+  operationId = 'sentence_request_004', orgCode = 'police'
+}
 local target2Created = MZPrison.Service.requestSentence(1, 3, target2Request)
 expect(target2Created == true, 'segunda identidade nao recebeu sentenca')
 local target2Id = 'sentence:sentence_request_004'
@@ -163,4 +183,4 @@ target2Online = true
 MZPrison.Service.tickOnce()
 expect(sentences[target2Id].remaining_seconds == 90 and audits >= 4, 'tempo online/reconnect nao foi contado')
 
-print('mz_prison P7 service harness: PASS cases=13')
+print('mz_prison P7 service harness: PASS cases=14')

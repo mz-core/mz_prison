@@ -7,6 +7,7 @@ local statements = {
     operation_id VARCHAR(64) NOT NULL,
     target_citizenid VARCHAR(64) NOT NULL,
     case_public_id VARCHAR(160) NOT NULL,
+    charge_public_id VARCHAR(160) NOT NULL,
     org_code VARCHAR(64) NOT NULL,
     rule_code VARCHAR(64) NOT NULL,
     rule_name VARCHAR(160) NOT NULL,
@@ -65,10 +66,19 @@ function Prepare.run()
     and MySQL.transaction and type(MySQL.transaction.await) == 'function') then
     Prepare.error = 'mysql_not_ready'; return false, Prepare.error
   end
-  local ok, errorValue = pcall(function()
+  local ok, columnOrError = pcall(function()
     for _, statement in ipairs(statements) do MySQL.query.await(statement) end
+    return MySQL.single.await([[SELECT COLUMN_NAME FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'mz_prison_sentences'
+        AND COLUMN_NAME = 'charge_public_id' LIMIT 1]])
   end)
-  Prepare.ready, Prepare.error = ok == true, ok and nil or tostring(errorValue)
+  if ok ~= true then
+    Prepare.error = tostring(columnOrError)
+  elseif not columnOrError then
+    Prepare.error = 'schema_outdated_missing_charge_public_id'
+  else
+    Prepare.ready, Prepare.error = true, nil
+  end
   return Prepare.ready, Prepare.error
 end
 
