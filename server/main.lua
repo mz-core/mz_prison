@@ -32,4 +32,12 @@ AddEventHandler('onResourceStop', function(resourceName)
   MZPrison.Service.stop()
 end)
 
+AddEventHandler('playerDropped', function()
+  MZPrison.Service.cleanupSource(source)
+end)
+
+AddEventHandler('mz_core:server:playerLoaded', function(playerSource)
+  MZPrison.Service.resumeSource(tonumber(playerSource))
+end)
+
 MZPrison.Initialize = initialize

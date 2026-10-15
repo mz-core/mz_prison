@@ -53,8 +53,8 @@ function Bridge.getProperty(targetSource, sentenceId)
   return value
 end
 
-function Bridge.restoreProperty(targetSource, sentenceId)
-  local ok, value = call('mz_inventory', 'RestorePrisonerProperty', targetSource, sentenceId)
+function Bridge.restoreProperty(targetSource, sentenceId, expectedItemCount)
+  local ok, value = call('mz_inventory', 'RestorePrisonerProperty', targetSource, sentenceId, expectedItemCount)
   if ok ~= true then return nil, tostring(value or 'property_restore_failed') end
   return value
 end
@@ -73,7 +73,11 @@ function Bridge.audit(action, actor, sentence, fields)
       caseId = sentence and (sentence.case_public_id or sentence.caseId),
       operationId = fields.operationId
     },
-    meta = { result = fields.result, reason = fields.reason, status = fields.status }
+    meta = {
+      result = fields.result, reason = fields.reason, status = fields.status,
+      activityId = fields.activityId, jobCode = fields.jobCode,
+      destinationId = fields.destinationId
+    }
   })
 end
 

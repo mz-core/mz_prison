@@ -55,6 +55,39 @@ local statements = {
     KEY idx_mz_prison_history_sentence (sentence_public_id, id),
     CONSTRAINT fk_mz_prison_history_sentence FOREIGN KEY (sentence_public_id)
       REFERENCES mz_prison_sentences(public_id) ON DELETE RESTRICT
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+  [[CREATE TABLE IF NOT EXISTS mz_prison_activities (
+    public_id VARCHAR(96) NOT NULL PRIMARY KEY,
+    operation_id VARCHAR(160) NOT NULL,
+    sentence_public_id VARCHAR(96) NOT NULL,
+    target_citizenid VARCHAR(64) NOT NULL,
+    job_code VARCHAR(64) NOT NULL,
+    point_id VARCHAR(64) NOT NULL,
+    duration_seconds INT UNSIGNED NOT NULL,
+    reduction_seconds INT UNSIGNED NOT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'in_progress',
+    started_session_id BIGINT UNSIGNED NOT NULL,
+    available_at TIMESTAMP NOT NULL,
+    completed_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_mz_prison_activities_operation (operation_id),
+    KEY idx_mz_prison_activities_sentence (sentence_public_id, status, created_at),
+    CONSTRAINT fk_mz_prison_activities_sentence FOREIGN KEY (sentence_public_id)
+      REFERENCES mz_prison_sentences(public_id) ON DELETE RESTRICT
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+  [[CREATE TABLE IF NOT EXISTS mz_prison_release_deliveries (
+    sentence_public_id VARCHAR(96) NOT NULL PRIMARY KEY,
+    destination_id VARCHAR(64) NOT NULL,
+    target_citizenid VARCHAR(64) NOT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'pending',
+    delivered_session_id BIGINT UNSIGNED NULL,
+    delivered_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_mz_prison_release_delivery_target (target_citizenid, status),
+    CONSTRAINT fk_mz_prison_release_delivery_sentence FOREIGN KEY (sentence_public_id)
+      REFERENCES mz_prison_sentences(public_id) ON DELETE RESTRICT
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]]
 }
 

@@ -18,6 +18,6 @@ expect(legacyOk == false and legacyError == 'schema_outdated_missing_charge_publ
 
 columnPresent = true
 local readyOk, readyError = MZPrison.Prepare.run()
-expect(readyOk == true and readyError == nil and createCalls == 6, 'schema atualizado nao ficou pronto')
+expect(readyOk == true and readyError == nil and createCalls == 10, 'schema atualizado nao ficou pronto')
 
 print('mz_prison P7 prepare harness: PASS cases=2')

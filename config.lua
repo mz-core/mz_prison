@@ -20,5 +20,6 @@ MZPrisonConfig = {
   manualReleaseReasons = {},
 
   jobsEnabled = false,
+  activityRateLimit = {},
   jobs = {}
 }

@@ -28,12 +28,74 @@ function Repository.getHistoryOperation(operationId)
   return MySQL.single.await('SELECT * FROM mz_prison_history WHERE operation_id = ? LIMIT 1', { operationId })
 end
 
+function Repository.getPendingReleaseHistory(sentenceId)
+  return MySQL.single.await([[SELECT * FROM mz_prison_history
+    WHERE sentence_public_id = ? AND action IN ('time_complete', 'reduction_release', 'manual_release', 'activity_release')
+    ORDER BY id DESC LIMIT 1]], { sentenceId })
+end
+
 function Repository.getByOperation(operationId)
   return MySQL.single.await('SELECT * FROM mz_prison_sentences WHERE operation_id = ? LIMIT 1', { operationId })
 end
 
 function Repository.getById(publicId)
   return MySQL.single.await('SELECT * FROM mz_prison_sentences WHERE public_id = ? LIMIT 1', { publicId })
+end
+
+function Repository.getActivityByOperation(operationId)
+  return MySQL.single.await([[SELECT *, UNIX_TIMESTAMP(available_at) AS available_at_epoch
+    FROM mz_prison_activities WHERE operation_id = ? LIMIT 1]], { operationId })
+end
+
+function Repository.getActivity(publicId)
+  return MySQL.single.await([[SELECT *, UNIX_TIMESTAMP(available_at) AS available_at_epoch
+    FROM mz_prison_activities WHERE public_id = ? LIMIT 1]], { publicId })
+end
+
+function Repository.getActiveActivity(sentenceId)
+  return MySQL.single.await([[SELECT *, UNIX_TIMESTAMP(available_at) AS available_at_epoch
+    FROM mz_prison_activities WHERE sentence_public_id = ? AND status = 'in_progress'
+    ORDER BY created_at DESC LIMIT 1]], { sentenceId })
+end
+
+function Repository.getActivitySummary(sentenceId, jobCode)
+  return MySQL.single.await([[SELECT COUNT(*) AS completed_count,
+    COALESCE(SUM(reduction_seconds), 0) AS reduction_seconds,
+    COALESCE(UNIX_TIMESTAMP(MAX(completed_at)), 0) AS last_completed_at
+    FROM mz_prison_activities WHERE sentence_public_id = ? AND job_code = ? AND status = 'completed']],
+    { sentenceId, jobCode }) or { completed_count = 0, reduction_seconds = 0, last_completed_at = 0 }
+end
+
+function Repository.listActivities(sentenceId)
+  return MySQL.query.await([[SELECT public_id, job_code, point_id, duration_seconds, reduction_seconds,
+    status, available_at, completed_at, created_at FROM mz_prison_activities
+    WHERE sentence_public_id = ? ORDER BY created_at DESC LIMIT 100]], { sentenceId }) or {}
+end
+
+function Repository.createActivity(data)
+  return transaction({ {
+    query = [[INSERT INTO mz_prison_activities
+      (public_id, operation_id, sentence_public_id, target_citizenid, job_code, point_id,
+       duration_seconds, reduction_seconds, status, started_session_id, available_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, FROM_UNIXTIME(?))]],
+    parameters = {
+      data.publicId, data.operationId, data.sentenceId, data.targetCitizenid, data.jobCode,
+      data.pointId, data.durationSeconds, data.reductionSeconds, data.sessionId, data.availableAt
+    }
+  } }, data.history)
+end
+
+function Repository.completeActivity(sentence, activity, remaining, historyData)
+  local status = remaining == 0 and 'release_pending' or 'active'
+  return transaction({ {
+    query = [[UPDATE mz_prison_activities SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+      WHERE public_id = ? AND status = 'in_progress']],
+    parameters = { activity.public_id }
+  }, {
+    query = [[UPDATE mz_prison_sentences SET remaining_seconds = ?, status = ?, last_error = NULL
+      WHERE public_id = ? AND status = 'active' AND remaining_seconds = ?]],
+    parameters = { remaining, status, sentence.public_id, sentence.remaining_seconds }
+  } }, historyData)
 end
 
 function Repository.getCurrent(citizenid)
@@ -109,8 +171,8 @@ function Repository.beginRelease(sentence, historyData)
   }, history(historyData) })
 end
 
-function Repository.finishRelease(sentenceId, historyData)
-  return transaction({ {
+function Repository.finishRelease(sentenceId, historyData, delivery)
+  local statements = { {
     query = [[UPDATE mz_prison_property SET status = 'restored'
       WHERE sentence_public_id = ? AND status = 'retained']],
     parameters = { sentenceId }
@@ -119,7 +181,38 @@ function Repository.finishRelease(sentenceId, historyData)
       remaining_seconds = 0, last_error = NULL, released_at = CURRENT_TIMESTAMP
       WHERE public_id = ? AND status = 'release_pending']],
     parameters = { sentenceId }
-  }, history(historyData) })
+  } }
+  if delivery then
+    statements[#statements + 1] = {
+      query = [[INSERT INTO mz_prison_release_deliveries
+        (sentence_public_id, destination_id, target_citizenid, status)
+        VALUES (?, ?, ?, 'pending') ON DUPLICATE KEY UPDATE destination_id = destination_id]],
+      parameters = { sentenceId, delivery.destinationId, delivery.targetCitizenid }
+    }
+  end
+  statements[#statements + 1] = history(historyData)
+  return transaction(statements)
+end
+
+function Repository.getReleaseDelivery(sentenceId)
+  return MySQL.single.await(
+    'SELECT * FROM mz_prison_release_deliveries WHERE sentence_public_id = ? LIMIT 1', { sentenceId }
+  )
+end
+
+function Repository.getPendingReleaseDelivery(citizenid)
+  return MySQL.single.await([[SELECT d.*, s.org_code FROM mz_prison_release_deliveries d
+    INNER JOIN mz_prison_sentences s ON s.public_id = d.sentence_public_id
+    WHERE d.target_citizenid = ? AND d.status = 'pending' ORDER BY d.created_at ASC LIMIT 1]], { citizenid })
+end
+
+function Repository.markReleaseDelivered(data)
+  return transaction({ {
+    query = [[UPDATE mz_prison_release_deliveries SET status = 'delivered',
+      delivered_session_id = ?, delivered_at = CURRENT_TIMESTAMP
+      WHERE sentence_public_id = ? AND destination_id = ? AND target_citizenid = ? AND status = 'pending']],
+    parameters = { data.sessionId, data.sentenceId, data.destinationId, data.targetCitizenid }
+  } }, data.history)
 end
 
 function Repository.tick(sentenceId, seconds)

@@ -1,7 +1,7 @@
 MZPrison = MZPrison or {}
 
 local Service = {}
-local locks = {}
+local locks, activityRates = {}, {}
 
 local function trim(value)
   return tostring(value or ''):gsub('^%s+', ''):gsub('%s+$', '')
@@ -67,7 +67,139 @@ local function sentenceResponse(sentence)
   local out = {}
   for key, value in pairs(sentence) do out[key] = value end
   out.property = MZPrison.Repository.listProperty(sentence.public_id or sentence.publicId)
+  out.activities = MZPrison.Repository.listActivities and MZPrison.Repository.listActivities(sentence.public_id or sentence.publicId) or {}
+  out.releaseDelivery = MZPrison.Repository.getReleaseDelivery
+    and MZPrison.Repository.getReleaseDelivery(sentence.public_id or sentence.publicId) or nil
   return out
+end
+
+local function releasePoint(sentence, destinationId)
+  local points = type(MZPrisonConfig.releasePoints) == 'table' and MZPrisonConfig.releasePoints or {}
+  local ids = {}
+  local selected
+  if destinationId then
+    ids[1] = destinationId
+  else
+    for id in pairs(points) do ids[#ids + 1] = tostring(id) end
+    table.sort(ids)
+  end
+  for _, id in ipairs(ids) do
+    local point = points[id]
+    local coords = type(point) == 'table' and point.coords or nil
+    local bucket = type(point) == 'table' and tonumber(point.routingBucket) or nil
+    local radius = type(point) == 'table' and tonumber(point.radius) or nil
+    local orgCode = type(point) == 'table' and token(point.orgCode, 2, 64, '^[a-z0-9_-]+$') or nil
+    if token(id, 2, 64, '^[a-z0-9_-]+$') and type(point) == 'table' and point.enabled == true
+      and orgCode == tostring(sentence.org_code or sentence.orgCode or '')
+      and type(coords) == 'table' and tonumber(coords.x) and tonumber(coords.y) and tonumber(coords.z)
+      and radius and radius > 0 and radius <= 25 and bucket and bucket >= 0 and bucket % 1 == 0 then
+      local valid = {
+        id = id, coords = { x = tonumber(coords.x), y = tonumber(coords.y), z = tonumber(coords.z) },
+        heading = tonumber(point.heading), routingBucket = bucket, radius = radius
+      }
+      if destinationId then return valid end
+      if selected then return nil end
+      selected = valid
+    end
+  end
+  return selected
+end
+
+local function atReleasePoint(source, destination)
+  if type(GetPlayerPed) ~= 'function' or type(GetEntityCoords) ~= 'function'
+    or type(GetPlayerRoutingBucket) ~= 'function' then return false end
+  local ped = GetPlayerPed(source)
+  local coords = ped and ped > 0 and GetEntityCoords(ped) or nil
+  local x, y, z = coords and tonumber(coords.x), coords and tonumber(coords.y), coords and tonumber(coords.z)
+  if not x or not y or not z or tonumber(GetPlayerRoutingBucket(source)) ~= destination.routingBucket then return false end
+  local target = destination.coords
+  return ((x - target.x) ^ 2 + (y - target.y) ^ 2 + (z - target.z) ^ 2) <= destination.radius ^ 2
+end
+
+local function dispatchRelease(identity, sentence)
+  if not MZPrison.Repository.getReleaseDelivery then return true end
+  local delivery = MZPrison.Repository.getReleaseDelivery(sentence.public_id)
+  if not delivery or tostring(delivery.status) ~= 'pending' then return true end
+  local destination = releasePoint(sentence, tostring(delivery.destination_id))
+  if not destination then
+    MZPrison.Repository.setError(sentence.public_id, 'release_destination_invalid')
+    return false, 'release_destination_invalid'
+  end
+  if type(SetPlayerRoutingBucket) ~= 'function' or type(TriggerClientEvent) ~= 'function' then
+    MZPrison.Repository.setError(sentence.public_id, 'release_destination_unavailable')
+    return false, 'release_destination_unavailable'
+  end
+  SetPlayerRoutingBucket(identity.source, destination.routingBucket)
+  TriggerClientEvent('mz_prison:client:release', identity.source, {
+    sentenceId = sentence.public_id, destinationId = destination.id,
+    coords = destination.coords, heading = destination.heading
+  })
+  return true
+end
+
+local function activityRateAllowed(source)
+  local config = type(MZPrisonConfig.activityRateLimit) == 'table' and MZPrisonConfig.activityRateLimit or {}
+  local duration, maximum = tonumber(config.windowMs), tonumber(config.maximum)
+  if not duration or duration <= 0 or not maximum or maximum <= 0 then return false, 'activity_rate_limit_not_configured' end
+  local now = type(GetGameTimer) == 'function' and GetGameTimer() or os.time() * 1000
+  local window = activityRates[source]
+  if not window or now - window.startedAt >= duration then
+    activityRates[source] = { startedAt = now, count = 1 }
+    return true
+  end
+  window.count = window.count + 1
+  if window.count > maximum then return false, 'rate_limited' end
+  return true
+end
+
+local function activityConfig(jobCode, pointId)
+  if MZPrisonConfig.jobsEnabled ~= true then return nil, nil, 'activities_disabled' end
+  jobCode, pointId = token(jobCode, 2, 64, '^[a-z0-9_-]+$'), token(pointId, 2, 64, '^[a-z0-9_-]+$')
+  local job = jobCode and type(MZPrisonConfig.jobs) == 'table' and MZPrisonConfig.jobs[jobCode] or nil
+  local point = pointId and type(job) == 'table' and type(job.points) == 'table' and job.points[pointId] or nil
+  local duration = type(job) == 'table' and math.floor(tonumber(job.durationSeconds) or 0) or 0
+  local reduction = type(job) == 'table' and math.floor(tonumber(job.reductionSeconds) or 0) or 0
+  local maximum = type(job) == 'table' and math.floor(tonumber(job.maximumCompletionsPerSentence) or 0) or 0
+  local maximumReduction = type(job) == 'table' and math.floor(tonumber(job.maximumReductionSecondsPerSentence) or 0) or 0
+  local cooldown = type(job) == 'table' and math.floor(tonumber(job.cooldownSeconds) or -1) or -1
+  local coords = type(point) == 'table' and point.coords or nil
+  local radius = type(point) == 'table' and tonumber(point.radius) or nil
+  local bucket = type(point) == 'table' and tonumber(point.routingBucket) or nil
+  if type(job) ~= 'table' or job.enabled ~= true or type(point) ~= 'table' or point.enabled ~= true
+    or duration <= 0 or reduction <= 0 or maximum <= 0 or maximumReduction <= 0 or cooldown < 0
+    or type(coords) ~= 'table' or not tonumber(coords.x) or not tonumber(coords.y) or not tonumber(coords.z)
+    or not radius or radius <= 0 or radius > 25 or not bucket or bucket < 0 or bucket % 1 ~= 0 then
+    return nil, nil, 'activity_not_configured'
+  end
+  return {
+    code = jobCode, duration = duration, reduction = reduction, maximum = maximum,
+    maximumReduction = maximumReduction, cooldown = cooldown
+  }, { id = pointId, coords = coords, radius = radius, routingBucket = bucket }
+end
+
+local function atActivityPoint(source, point)
+  if type(GetPlayerPed) ~= 'function' or type(GetEntityCoords) ~= 'function'
+    or type(GetPlayerRoutingBucket) ~= 'function' then return false, 'position_unavailable' end
+  local ped = GetPlayerPed(source)
+  local coords = ped and ped > 0 and GetEntityCoords(ped) or nil
+  local x, y, z = coords and tonumber(coords.x), coords and tonumber(coords.y), coords and tonumber(coords.z)
+  if not x or not y or not z then return false, 'position_unavailable' end
+  if tonumber(GetPlayerRoutingBucket(source)) ~= point.routingBucket then return false, 'activity_bucket_required' end
+  local target = point.coords
+  if ((x - tonumber(target.x)) ^ 2 + (y - tonumber(target.y)) ^ 2 + (z - tonumber(target.z)) ^ 2)
+    > point.radius ^ 2 then return false, 'activity_point_required' end
+  return true
+end
+
+local function activityAllowed(sentenceId, job)
+  local summary = MZPrison.Repository.getActivitySummary(sentenceId, job.code)
+  if math.floor(tonumber(summary.completed_count) or 0) >= job.maximum then return false, 'activity_limit_reached' end
+  if math.floor(tonumber(summary.reduction_seconds) or 0) + job.reduction > job.maximumReduction then
+    return false, 'activity_reduction_limit_reached'
+  end
+  local completedAt = math.floor(tonumber(summary.last_completed_at) or 0)
+  if completedAt > 0 and os.time() - completedAt < job.cooldown then return false, 'activity_cooldown' end
+  return true
 end
 
 local function atIntakePoint(source)
@@ -96,6 +228,11 @@ end
 local function releaseSentence(sentence, actor, operationId, requestFingerprint, action)
   local replayed, replayError = historyReplay(operationId, requestFingerprint)
   if replayed == nil then return false, replayError end
+  if tostring(sentence.status) == 'release_pending' and not replayed
+    and MZPrison.Repository.getPendingReleaseHistory then
+    local pending = MZPrison.Repository.getPendingReleaseHistory(sentence.public_id)
+    if pending then return false, 'release_operation_pending' end
+  end
   if not replayed then
     local begun = MZPrison.Repository.beginRelease(sentence, {
       operationId = operationId, requestFingerprint = requestFingerprint,
@@ -105,25 +242,45 @@ local function releaseSentence(sentence, actor, operationId, requestFingerprint,
     if not begun then return false, 'persistence_failed' end
   end
   sentence = MZPrison.Repository.getById(sentence.public_id)
-  if tostring(sentence.status) == 'released' then return true, sentenceResponse(sentence) end
+  if not sentence then return false, 'sentence_not_found' end
+  if tostring(sentence.status) == 'released' then
+    local targetSource = MZPrison.Bridge.getSource(sentence.target_citizenid)
+    if targetSource then
+      local identity = MZPrison.Bridge.resolveIdentity(targetSource)
+      if identity and identity.citizenid == tostring(sentence.target_citizenid) then dispatchRelease(identity, sentence) end
+    end
+    return true, sentenceResponse(sentence)
+  end
   local targetSource, sourceError = MZPrison.Bridge.getSource(sentence.target_citizenid)
   if not targetSource then MZPrison.Repository.setError(sentence.public_id, sourceError); return false, sourceError end
-  local restored, restoreError = MZPrison.Bridge.restoreProperty(targetSource, sentence.public_id)
+  local targetIdentity, identityError = MZPrison.Bridge.resolveIdentity(targetSource)
+  if not targetIdentity or targetIdentity.citizenid ~= tostring(sentence.target_citizenid) then
+    local errorCode = identityError or 'target_identity_mismatch'
+    MZPrison.Repository.setError(sentence.public_id, errorCode)
+    return false, errorCode
+  end
+  local expectedProperty = MZPrison.Repository.listProperty(sentence.public_id)
+  local restored, restoreError = MZPrison.Bridge.restoreProperty(targetSource, sentence.public_id, #expectedProperty)
   if not restored then MZPrison.Repository.setError(sentence.public_id, restoreError); return false, restoreError end
   local finishOperation = operationId .. ':property'
   local finishFingerprint = fingerprint(sentence.public_id, 'property_restored')
   local finishReplay, finishError = historyReplay(finishOperation, finishFingerprint)
   if finishReplay == nil then return false, finishError end
+  local destination = releasePoint(sentence)
   if not finishReplay and not MZPrison.Repository.finishRelease(sentence.public_id, {
     operationId = finishOperation, requestFingerprint = finishFingerprint,
     sentenceId = sentence.public_id, action = 'property_restored',
     actorCitizenid = actor and actor.citizenid or nil,
-    details = { itemCount = #(restored.items or {}) }
-  }) then return false, 'persistence_failed' end
+    details = { itemCount = #(restored.items or {}), destinationId = destination and destination.id or nil }
+  }, destination and { destinationId = destination.id, targetCitizenid = sentence.target_citizenid } or nil) then
+    return false, 'persistence_failed'
+  end
   sentence = MZPrison.Repository.getById(sentence.public_id)
   MZPrison.Bridge.audit('released', actor, sentence, {
-    operationId = operationId, result = 'released', status = sentence.status
+    operationId = operationId, result = 'released', status = sentence.status,
+    destinationId = destination and destination.id or nil
   })
+  dispatchRelease(targetIdentity, sentence)
   return true, sentenceResponse(sentence)
 end
 
@@ -236,10 +393,18 @@ function Service.reduceSentence(actorSource, citizenid, request)
   return withLock('citizen:' .. citizenid, function()
     local replayed, replayError = historyReplay(operationId, requestFingerprint)
     if replayed == nil then return false, replayError end
+    if replayed then
+      local historyRow = MZPrison.Repository.getHistoryOperation(operationId)
+      local previous = historyRow and MZPrison.Repository.getById(
+        historyRow.sentence_public_id or historyRow.sentenceId
+      ) or nil
+      if not previous or tostring(previous.target_citizenid) ~= citizenid
+        or tostring(previous.org_code) ~= orgCode then return false, 'operation_id_conflict' end
+      return true, sentenceResponse(previous)
+    end
     local sentence = MZPrison.Repository.getCurrent(citizenid)
     if not sentence then return false, 'active_sentence_not_found' end
     if tostring(sentence.org_code) ~= orgCode then return false, 'organization_mismatch' end
-    if replayed then return true, sentenceResponse(sentence) end
     if tostring(sentence.status) ~= 'active' then return false, 'sentence_not_active' end
     local reduced, remaining = MZPrison.Repository.reduce(sentence, reduction.seconds, {
       operationId = operationId, requestFingerprint = requestFingerprint,
@@ -272,11 +437,212 @@ function Service.releasePrisoner(actorSource, citizenid, request)
   end
   local requestFingerprint = fingerprint(citizenid, orgCode, reasonCode)
   return withLock('citizen:' .. citizenid, function()
+    local replayed, replayError = historyReplay(operationId, requestFingerprint)
+    if replayed == nil then return false, replayError end
+    if replayed then
+      local historyRow = MZPrison.Repository.getHistoryOperation(operationId)
+      local previous = historyRow and MZPrison.Repository.getById(
+        historyRow.sentence_public_id or historyRow.sentenceId
+      ) or nil
+      if not previous or tostring(previous.target_citizenid) ~= citizenid
+        or tostring(previous.org_code) ~= orgCode then return false, 'operation_id_conflict' end
+      return releaseSentence(previous, actor, operationId, requestFingerprint, 'manual_release')
+    end
     local sentence = MZPrison.Repository.getCurrent(citizenid)
     if not sentence then return false, 'active_sentence_not_found' end
     if tostring(sentence.org_code) ~= orgCode then return false, 'organization_mismatch' end
     return releaseSentence(sentence, actor, operationId, requestFingerprint, 'manual_release')
   end)
+end
+
+function Service.startActivity(source, request)
+  if not closed(request, { jobCode = true, pointId = true, requestId = true }) then return false, 'invalid_request' end
+  if MZPrisonConfig.jobsEnabled ~= true then return false, 'activities_disabled' end
+  local rateOk, rateError = activityRateAllowed(source)
+  if not rateOk then return false, rateError end
+  local identity, identityError = MZPrison.Bridge.resolveIdentity(source)
+  if not identity then return false, identityError end
+  local job, point, configError = activityConfig(request.jobCode, request.pointId)
+  if not job then return false, configError end
+  local requestId = token(request.requestId, 8, 40, '^[%w_-]+$')
+  if not requestId then return false, 'invalid_request_id' end
+  local operationId = ('activity_start:%s:%s'):format(identity.sessionId, requestId)
+  local requestFingerprint = fingerprint(identity.citizenid, job.code, point.id)
+  local publicId = ('activity:%s:%s'):format(identity.sessionId, requestId)
+
+  return withLock('citizen:' .. identity.citizenid, function()
+    local replayed, replayError = historyReplay(operationId, requestFingerprint)
+    if replayed == nil then return false, replayError end
+    if replayed then
+      local activity = MZPrison.Repository.getActivityByOperation(operationId)
+      return activity and true, activity or 'activity_not_found'
+    end
+    local sentence = MZPrison.Repository.getCurrent(identity.citizenid)
+    if not sentence then return false, 'active_sentence_not_found' end
+    if tostring(sentence.status) ~= 'active' then return false, 'sentence_not_active' end
+    if MZPrison.Repository.getActiveActivity(sentence.public_id) then return false, 'activity_already_active' end
+    local allowed, allowedError = activityAllowed(sentence.public_id, job)
+    if not allowed then return false, allowedError end
+    local atPoint, pointError = atActivityPoint(source, point)
+    if not atPoint then return false, pointError end
+    local availableAt = os.time() + job.duration
+    local saved = MZPrison.Repository.createActivity({
+      publicId = publicId, operationId = operationId, sentenceId = sentence.public_id,
+      targetCitizenid = identity.citizenid, jobCode = job.code, pointId = point.id,
+      durationSeconds = job.duration, reductionSeconds = job.reduction,
+      sessionId = identity.sessionId, availableAt = availableAt,
+      history = {
+        operationId = operationId, requestFingerprint = requestFingerprint,
+        sentenceId = sentence.public_id, action = 'activity_started', actorCitizenid = identity.citizenid,
+        details = { activityId = publicId, jobCode = job.code, pointId = point.id, durationSeconds = job.duration }
+      }
+    })
+    if not saved then return false, 'persistence_failed' end
+    local activity = MZPrison.Repository.getActivity(publicId)
+    MZPrison.Bridge.audit('activity_started', identity, sentence, {
+      operationId = operationId, result = 'started', status = sentence.status,
+      activityId = publicId, jobCode = job.code
+    })
+    return true, activity
+  end)
+end
+
+function Service.completeActivity(source, request)
+  if not closed(request, { activityId = true, requestId = true }) then return false, 'invalid_request' end
+  if MZPrisonConfig.jobsEnabled ~= true then return false, 'activities_disabled' end
+  local rateOk, rateError = activityRateAllowed(source)
+  if not rateOk then return false, rateError end
+  local identity, identityError = MZPrison.Bridge.resolveIdentity(source)
+  if not identity then return false, identityError end
+  local activityId = token(request.activityId, 8, 96)
+  local requestId = token(request.requestId, 8, 40, '^[%w_-]+$')
+  if not activityId or not requestId then return false, 'invalid_request' end
+  local operationId = ('activity_complete:%s:%s'):format(identity.sessionId, requestId)
+
+  return withLock('citizen:' .. identity.citizenid, function()
+    local activity = MZPrison.Repository.getActivity(activityId)
+    if not activity or tostring(activity.target_citizenid) ~= identity.citizenid then
+      return false, 'activity_not_found'
+    end
+    if tostring(activity.status) == 'completed' then return true, activity end
+    if tostring(activity.status) ~= 'in_progress' then return false, 'activity_not_active' end
+    local job, point, configError = activityConfig(activity.job_code, activity.point_id)
+    if not job then return false, configError end
+    if math.floor(tonumber(activity.duration_seconds) or 0) ~= job.duration
+      or math.floor(tonumber(activity.reduction_seconds) or 0) ~= job.reduction then
+      return false, 'activity_configuration_changed'
+    end
+    local requestFingerprint = fingerprint(identity.citizenid, activityId, job.code, point.id)
+    local replayed, replayError = historyReplay(operationId, requestFingerprint)
+    if replayed == nil then return false, replayError end
+    if replayed then return true, MZPrison.Repository.getActivity(activityId) end
+    local sentence = MZPrison.Repository.getById(activity.sentence_public_id)
+    if not sentence or tostring(sentence.target_citizenid) ~= identity.citizenid then
+      return false, 'active_sentence_not_found'
+    end
+    if tostring(sentence.status) ~= 'active' then return false, 'sentence_not_active' end
+    if os.time() < math.floor(tonumber(activity.available_at_epoch) or 0) then return false, 'activity_incomplete' end
+    local atPoint, pointError = atActivityPoint(source, point)
+    if not atPoint then return false, pointError end
+    local allowed, allowedError = activityAllowed(sentence.public_id, job)
+    if not allowed then return false, allowedError end
+    local remaining = math.max(0, math.floor(tonumber(sentence.remaining_seconds) or 0) - job.reduction)
+    local saved = MZPrison.Repository.completeActivity(sentence, activity, remaining, {
+      operationId = operationId, requestFingerprint = requestFingerprint,
+      sentenceId = sentence.public_id, action = 'activity_completed', actorCitizenid = identity.citizenid,
+      details = { activityId = activityId, jobCode = job.code, reductionSeconds = job.reduction }
+    })
+    if not saved then return false, 'persistence_failed' end
+    sentence = MZPrison.Repository.getById(sentence.public_id)
+    MZPrison.Bridge.audit('activity_completed', identity, sentence, {
+      operationId = operationId, result = 'completed', status = sentence.status,
+      activityId = activityId, jobCode = job.code
+    })
+    if remaining == 0 then
+      local releaseOperation = 'activity_release:' .. activityId
+      return releaseSentence(sentence, identity, releaseOperation,
+        fingerprint(sentence.public_id, activityId, 'activity_release'), 'activity_release')
+    end
+    return true, sentenceResponse(sentence)
+  end)
+end
+
+function Service.acknowledgeRelease(source, request)
+  if not closed(request, { sentenceId = true, destinationId = true }) then return false, 'invalid_request' end
+  local identity, identityError = MZPrison.Bridge.resolveIdentity(source)
+  if not identity then return false, identityError end
+  local sentenceId = token(request.sentenceId, 8, 96)
+  local destinationId = token(request.destinationId, 2, 64, '^[a-z0-9_-]+$')
+  if not sentenceId or not destinationId or not MZPrison.Repository.getReleaseDelivery then
+    return false, 'invalid_request'
+  end
+  return withLock('citizen:' .. identity.citizenid, function()
+    local sentence = MZPrison.Repository.getById(sentenceId)
+    local delivery = MZPrison.Repository.getReleaseDelivery(sentenceId)
+    if not sentence or tostring(sentence.status) ~= 'released'
+      or tostring(sentence.target_citizenid) ~= identity.citizenid
+      or not delivery or tostring(delivery.destination_id) ~= destinationId then
+      return false, 'release_delivery_not_found'
+    end
+    if tostring(delivery.status) == 'delivered' then return true, delivery end
+    local destination = releasePoint(sentence, destinationId)
+    if tostring(delivery.status) ~= 'pending' or not destination then
+      return false, 'release_destination_invalid'
+    end
+    if not atReleasePoint(source, destination) then return false, 'release_destination_not_reached' end
+    local operationId = ('release_destination:%s:%s'):format(sentenceId, identity.sessionId)
+    local requestFingerprint = fingerprint(sentenceId, destinationId, identity.citizenid)
+    local replayed, replayError = historyReplay(operationId, requestFingerprint)
+    if replayed == nil then return false, replayError end
+    if not replayed and not MZPrison.Repository.markReleaseDelivered({
+      sentenceId = sentenceId, destinationId = destinationId,
+      targetCitizenid = identity.citizenid, sessionId = identity.sessionId,
+      history = {
+        operationId = operationId, requestFingerprint = requestFingerprint,
+        sentenceId = sentenceId, action = 'release_destination_delivered',
+        actorCitizenid = identity.citizenid, details = { destinationId = destinationId }
+      }
+    }) then return false, 'persistence_failed' end
+    MZPrison.Bridge.audit('release_destination_delivered', identity, sentence, {
+      operationId = operationId, result = 'delivered', status = 'released', destinationId = destinationId
+    })
+    return true, MZPrison.Repository.getReleaseDelivery(sentenceId)
+  end)
+end
+
+function Service.resumeSource(source)
+  local identity, identityError = MZPrison.Bridge.resolveIdentity(source)
+  if not identity then return false, identityError end
+  local sentence = MZPrison.Repository.getCurrent(identity.citizenid)
+  if sentence and tostring(sentence.status) == 'release_pending' then
+    return withLock('citizen:' .. identity.citizenid, function()
+      sentence = MZPrison.Repository.getById(sentence.public_id)
+      local pending = MZPrison.Repository.getPendingReleaseHistory
+        and MZPrison.Repository.getPendingReleaseHistory(sentence.public_id) or nil
+      local operationId = pending and tostring(pending.operation_id or pending.operationId) or ('auto_release:%s'):format(sentence.public_id)
+      local requestFingerprint = pending and tostring(pending.request_fingerprint or pending.requestFingerprint)
+        or fingerprint(sentence.public_id, 'time_complete')
+      local action = pending and tostring(pending.action) or 'time_complete'
+      return releaseSentence(sentence, nil, operationId, requestFingerprint, action)
+    end)
+  end
+  if sentence and tostring(sentence.status) == 'active' and MZPrison.Repository.getActiveActivity
+    and type(TriggerClientEvent) == 'function' then
+    local activity = MZPrison.Repository.getActiveActivity(sentence.public_id)
+    if activity then
+      TriggerClientEvent('mz_prison:client:activity:result', identity.source, {
+        action = 'resume', ok = true, result = activity
+      })
+    end
+  end
+  if MZPrison.Repository.getPendingReleaseDelivery then
+    local delivery = MZPrison.Repository.getPendingReleaseDelivery(identity.citizenid)
+    if delivery then
+      local released = MZPrison.Repository.getById(delivery.sentence_public_id)
+      if released then return dispatchRelease(identity, released) end
+    end
+  end
+  return true
 end
 
 function Service.tickOnce()
@@ -290,14 +656,21 @@ function Service.tickOnce()
         if source then sentence = MZPrison.Repository.tick(sentence.public_id, seconds) end
       end
       if sentence and tostring(sentence.status) == 'release_pending' then
-        local operationId = ('auto_release:%s'):format(sentence.public_id)
-        releaseSentence(sentence, nil, operationId, fingerprint(sentence.public_id, 'time_complete'), 'time_complete')
+        local pending = MZPrison.Repository.getPendingReleaseHistory
+          and MZPrison.Repository.getPendingReleaseHistory(sentence.public_id) or nil
+        local operationId = pending and tostring(pending.operation_id or pending.operationId)
+          or ('auto_release:%s'):format(sentence.public_id)
+        local requestFingerprint = pending and tostring(pending.request_fingerprint or pending.requestFingerprint)
+          or fingerprint(sentence.public_id, 'time_complete')
+        releaseSentence(sentence, nil, operationId, requestFingerprint,
+          pending and tostring(pending.action) or 'time_complete')
       end
       return true
     end)
   end
 end
 
-function Service.stop() locks = {} end
+function Service.cleanupSource(source) activityRates[tonumber(source)] = nil end
+function Service.stop() locks, activityRates = {}, {} end
 
 MZPrison.Service = Service

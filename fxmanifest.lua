@@ -4,11 +4,13 @@ game 'gta5'
 name 'mz_prison'
 author 'Mazus / MZ Framework'
 description 'Canonical prison sentence and retained-property domain for MZ Framework'
-version '0.1.0'
+version '0.2.0'
 
 lua54 'yes'
 
 shared_scripts { 'config.lua' }
+
+client_scripts { 'client/release.lua' }
 
 server_scripts {
   '@oxmysql/lib/MySQL.lua',
@@ -16,6 +18,7 @@ server_scripts {
   'server/prepare.lua',
   'server/repository.lua',
   'server/service.lua',
+  'server/events.lua',
   'server/exports.lua',
   'server/main.lua'
 }
