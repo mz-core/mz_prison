@@ -41,6 +41,12 @@ function Bridge.getSource(citizenid)
   return result
 end
 
+function Bridge.getDeathState(source)
+  local ok, state = call('mz_core', 'GetDeathState', source)
+  if ok ~= true or type(state) ~= 'table' then return nil end
+  return state
+end
+
 function Bridge.retainProperty(targetSource, sentenceId)
   local ok, value = call('mz_inventory', 'RetainPrisonerProperty', targetSource, sentenceId)
   if ok ~= true then return nil, tostring(value or 'property_retain_failed') end
@@ -56,6 +62,18 @@ end
 function Bridge.restoreProperty(targetSource, sentenceId, expectedItemCount)
   local ok, value = call('mz_inventory', 'RestorePrisonerProperty', targetSource, sentenceId, expectedItemCount)
   if ok ~= true then return nil, tostring(value or 'property_restore_failed') end
+  return value
+end
+
+function Bridge.applyUniform(targetSource, sentenceId, garments)
+  local ok, value = call('mz_inventory', 'ApplyPrisonUniform', targetSource, sentenceId, garments)
+  if ok ~= true then return nil, tostring(value or 'prison_uniform_apply_failed') end
+  return value
+end
+
+function Bridge.removeUniform(targetSource, sentenceId)
+  local ok, value = call('mz_inventory', 'RemovePrisonUniform', targetSource, sentenceId)
+  if ok ~= true then return nil, tostring(value or 'prison_uniform_remove_failed') end
   return value
 end
 
@@ -76,7 +94,7 @@ function Bridge.audit(action, actor, sentence, fields)
     meta = {
       result = fields.result, reason = fields.reason, status = fields.status,
       activityId = fields.activityId, jobCode = fields.jobCode,
-      destinationId = fields.destinationId
+      destinationId = fields.destinationId, chargeCount = fields.chargeCount
     }
   })
 end

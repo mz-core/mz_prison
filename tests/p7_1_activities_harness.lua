@@ -28,6 +28,7 @@ local function summary(jobCode)
 end
 
 MZPrison = {
+  Prepare = { ready = true },
   Bridge = {
     resolveIdentity = function(source)
       if source ~= 4 then return nil, 'identity_unavailable' end

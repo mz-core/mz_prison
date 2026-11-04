@@ -109,14 +109,69 @@ function Repository.createSentence(data)
     query = [[INSERT INTO mz_prison_sentences
       (public_id, operation_id, target_citizenid, case_public_id, charge_public_id, org_code, rule_code,
        rule_name, legal_version, duration_seconds, remaining_seconds, clock_mode,
-       status, property_status, sentenced_by_citizenid)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intake_pending', 'pending', ?)]],
+       status, property_status, facility_id, intake_point_id, cell_id, previous_routing_bucket,
+       confinement_status, sentenced_by_citizenid)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intake_pending', 'pending', ?, ?, ?, ?, ?, ?)]],
     parameters = {
       data.publicId, data.operationId, data.targetCitizenid, data.caseId, data.chargeId, data.orgCode,
       data.ruleCode, data.ruleName, data.legalVersion, data.durationSeconds,
-      data.durationSeconds, data.clockMode, data.actorCitizenid
+      data.durationSeconds, data.clockMode, data.facilityId, data.intakePointId, data.cellId,
+      data.previousRoutingBucket or 0, data.facilityId and 'pending' or 'not_applicable', data.actorCitizenid
+    }
+  }, {
+    query = [[INSERT INTO mz_prison_sentence_charges
+      (sentence_public_id, charge_public_id, rule_code, rule_name, legal_version,
+       sentence_seconds, is_primary) VALUES (?, ?, ?, ?, ?, ?, 1)]],
+    parameters = {
+      data.publicId, data.chargeId, data.ruleCode, data.ruleName, data.legalVersion, data.durationSeconds
     }
   }, history(data.history) })
+end
+
+function Repository.getChargeSentence(chargePublicId)
+  return MySQL.single.await(
+    'SELECT sentence_public_id FROM mz_prison_sentence_charges WHERE charge_public_id = ? LIMIT 1',
+    { chargePublicId }
+  )
+end
+
+function Repository.listSentenceCharges(sentenceId)
+  return MySQL.query.await([[SELECT charge_public_id, rule_code, rule_name, legal_version,
+    sentence_seconds, is_primary, created_at FROM mz_prison_sentence_charges
+    WHERE sentence_public_id = ? ORDER BY is_primary DESC, created_at ASC]], { sentenceId }) or {}
+end
+
+-- P7.4B -- uma sentenca com N acusacoes. A sentenca continua sendo uma unica
+-- linha em mz_prison_sentences; a tabela de vinculo guarda o snapshot de cada
+-- charge e o UNIQUE(charge_public_id) impede a mesma acusacao duas vezes.
+function Repository.createSentenceWithCharges(data)
+  local statements = { {
+    query = [[INSERT INTO mz_prison_sentences
+      (public_id, operation_id, target_citizenid, case_public_id, charge_public_id, org_code, rule_code,
+       rule_name, legal_version, duration_seconds, remaining_seconds, clock_mode,
+       status, property_status, facility_id, intake_point_id, cell_id, previous_routing_bucket,
+       confinement_status, sentenced_by_citizenid)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intake_pending', 'pending', ?, ?, ?, ?, ?, ?)]],
+    parameters = {
+      data.publicId, data.operationId, data.targetCitizenid, data.caseId, data.primaryChargeId,
+      data.orgCode, data.ruleCode, data.ruleName, data.legalVersion, data.durationSeconds,
+      data.durationSeconds, data.clockMode, data.facilityId, data.intakePointId, data.cellId,
+      data.previousRoutingBucket or 0, data.facilityId and 'pending' or 'not_applicable', data.actorCitizenid
+    }
+  } }
+  for _, charge in ipairs(data.charges or {}) do
+    statements[#statements + 1] = {
+      query = [[INSERT INTO mz_prison_sentence_charges
+        (sentence_public_id, charge_public_id, rule_code, rule_name, legal_version,
+         sentence_seconds, is_primary) VALUES (?, ?, ?, ?, ?, ?, ?)]],
+      parameters = {
+        data.publicId, charge.chargeId, charge.ruleCode, charge.ruleName, charge.legalVersion,
+        charge.sentenceSeconds, charge.chargeId == data.primaryChargeId and 1 or 0
+      }
+    }
+  end
+  statements[#statements + 1] = history(data.history)
+  return transaction(statements)
 end
 
 function Repository.activateWithProperty(sentenceId, items, historyData)
@@ -144,6 +199,11 @@ function Repository.activateWithProperty(sentenceId, items, historyData)
   }
   statements[#statements + 1] = history(historyData)
   return transaction(statements)
+end
+
+function Repository.markConfinement(sentenceId, status)
+  return (MySQL.update.await([[UPDATE mz_prison_sentences SET confinement_status = ?, last_error = NULL
+    WHERE public_id = ? AND status = 'active']], { status, sentenceId }) or 0) > 0
 end
 
 function Repository.setError(sentenceId, errorCode)
@@ -178,6 +238,7 @@ function Repository.finishRelease(sentenceId, historyData, delivery)
     parameters = { sentenceId }
   }, {
     query = [[UPDATE mz_prison_sentences SET status = 'released', property_status = 'restored',
+      confinement_status = 'released',
       remaining_seconds = 0, last_error = NULL, released_at = CURRENT_TIMESTAMP
       WHERE public_id = ? AND status = 'release_pending']],
     parameters = { sentenceId }

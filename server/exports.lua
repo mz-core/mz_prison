@@ -7,6 +7,11 @@ exports('RequestSentence', function(actorSource, targetSource, request)
   return MZPrison.Service.requestSentence(actorSource, targetSource, request)
 end)
 
+exports('RequestSentenceFromCharges', function(actorSource, targetSource, request)
+  if not policeCaller() then return false, 'forbidden_caller' end
+  return MZPrison.Service.requestSentenceFromCharges(actorSource, targetSource, request)
+end)
+
 exports('GetSentence', function(citizenid)
   if not policeCaller() then return false, 'forbidden_caller' end
   return MZPrison.Service.getSentence(citizenid)

@@ -18,6 +18,7 @@ function GetEntityCoords(source) return source == 2 and { x = 10.0, y = 20.0, z 
 function GetPlayerRoutingBucket() return 0 end
 
 MZPrison = {
+  Prepare = { ready = true },
   Bridge = {
     resolveIdentity = function(source)
       return { source = source, sessionId = source * 10, characterId = source * 100,
@@ -38,6 +39,7 @@ MZPrison = {
       restoreCalls = restoreCalls + 1
       return { sentenceId = sentenceId, items = property[sentenceId] or {} }
     end,
+    removeUniform = function() return {} end,
     audit = function() audits = audits + 1 end
   }
 }
@@ -115,10 +117,10 @@ local disabledOk, disabledError = MZPrison.Service.requestSentence(1, 2, request
 expect(disabledOk == false and disabledError == 'intake_not_configured', 'intake sem coordenadas foi aceito')
 
 MZPrisonConfig.intakeEnabled = true
-MZPrisonConfig.intakePoints = { booking = { coords = { x = 100.0, y = 100.0, z = 100.0 }, radius = 2.0 } }
+MZPrisonConfig.intakePoints = { booking = { enabled = true, coords = { x = 100.0, y = 100.0, z = 100.0 }, radius = 2.0, routingBucket = 0 } }
 local pointOk, pointError = MZPrison.Service.requestSentence(1, 2, request)
 expect(pointOk == false and pointError == 'intake_point_required', 'intake fora do ponto foi aceito')
-MZPrisonConfig.intakePoints = { booking = { coords = { x = 10.0, y = 20.0, z = 30.0 }, radius = 2.0 } }
+MZPrisonConfig.intakePoints = { booking = { enabled = true, coords = { x = 10.0, y = 20.0, z = 30.0 }, radius = 2.0, routingBucket = 0 } }
 local rulesOk, rulesError = MZPrison.Service.requestSentence(1, 2, request)
 expect(rulesOk == false and rulesError == 'rules_disabled', 'regra de sentenca desabilitada foi aceita')
 MZPrisonConfig.sentenceRulesEnabled = true

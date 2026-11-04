@@ -23,6 +23,11 @@ AddEventHandler('mz_prison:server:release:ack', function(payload)
   MZPrison.Service.acknowledgeRelease(source, payload)
 end)
 
+RegisterNetEvent('mz_prison:server:confinement:ack')
+AddEventHandler('mz_prison:server:confinement:ack', function(payload)
+  MZPrison.Service.acknowledgeConfinement(source, payload)
+end)
+
 RegisterNetEvent('mz_prison:server:resume')
 AddEventHandler('mz_prison:server:resume', function()
   MZPrison.Service.resumeSource(source)

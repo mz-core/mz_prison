@@ -1,7 +1,7 @@
 MZPrison = MZPrison or {}
 
 local Service = {}
-local locks, activityRates = {}, {}
+local locks, activityRates, confinementCorrections = {}, {}, {}
 
 local function trim(value)
   return tostring(value or ''):gsub('^%s+', ''):gsub('%s+$', '')
@@ -17,6 +17,10 @@ local function closed(value, allowed)
   if type(value) ~= 'table' then return false end
   for key in pairs(value) do if not allowed[key] then return false end end
   return true
+end
+
+local function available()
+  return MZPrison.Prepare ~= nil and MZPrison.Prepare.ready == true
 end
 
 local function fingerprint(...)
@@ -53,7 +57,8 @@ local function rule(section, orgCode, ruleCode)
   if not enabledKey or MZPrisonConfig[enabledKey] ~= true then return nil, 'rules_disabled' end
   local jurisdiction = type(MZPrisonConfig.jurisdictions) == 'table' and MZPrisonConfig.jurisdictions[orgCode] or nil
   if type(jurisdiction) ~= 'table' or jurisdiction.enabled ~= true then return nil, 'jurisdiction_disabled' end
-  ruleCode = token(ruleCode, 2, 64, '^[a-z0-9_-]+$')
+  -- Mesmo charset aceito pelo catalogo policial (ruleCode pode ser MAIUSCULO).
+  ruleCode = token(ruleCode, 2, 64, '^[%w:_-]+$')
   local value = ruleCode and type(MZPrisonConfig[section]) == 'table' and MZPrisonConfig[section][ruleCode] or nil
   if type(value) ~= 'table' or value.enabled ~= true then return nil, 'rule_not_configured' end
   local name = trim(value.name or value.label)
@@ -68,9 +73,29 @@ local function sentenceResponse(sentence)
   for key, value in pairs(sentence) do out[key] = value end
   out.property = MZPrison.Repository.listProperty(sentence.public_id or sentence.publicId)
   out.activities = MZPrison.Repository.listActivities and MZPrison.Repository.listActivities(sentence.public_id or sentence.publicId) or {}
+  out.charges = MZPrison.Repository.listSentenceCharges
+    and MZPrison.Repository.listSentenceCharges(sentence.public_id or sentence.publicId) or {}
   out.releaseDelivery = MZPrison.Repository.getReleaseDelivery
     and MZPrison.Repository.getReleaseDelivery(sentence.public_id or sentence.publicId) or nil
   return out
+end
+
+-- Evento de apresentacao para o HUD do preso. Nao concede autoridade e nao
+-- substitui GetSentence/RequestSentence; apenas publica o snapshot autorizado.
+local function pushSentenceStatus(source, sentence)
+  if type(TriggerClientEvent) ~= 'function' or not source or type(sentence) ~= 'table' then return end
+  local sentenceId = tostring(sentence.public_id or sentence.publicId or '')
+  if sentenceId == '' then return end
+  local remaining = tonumber(sentence.remaining_seconds or sentence.remainingSeconds
+    or sentence.duration_seconds or sentence.durationSeconds) or 0
+  TriggerClientEvent('mz_prison:client:sentence', source, {
+    sentenceId = sentenceId,
+    status = tostring(sentence.status or ''),
+    remainingSeconds = math.max(0, math.floor(remaining)),
+    facilityId = sentence.facility_id and tostring(sentence.facility_id) or nil,
+    cellId = sentence.cell_id and tostring(sentence.cell_id) or nil,
+    clockMode = tostring(sentence.clock_mode or MZPrisonConfig.clockMode or '')
+  })
 end
 
 local function releasePoint(sentence, destinationId)
@@ -134,6 +159,15 @@ local function dispatchRelease(identity, sentence)
     sentenceId = sentence.public_id, destinationId = destination.id,
     coords = destination.coords, heading = destination.heading
   })
+  return true
+end
+
+local function restoreRoutingBucket(identity, sentence)
+  local destination = releasePoint(sentence)
+  if destination then return dispatchRelease(identity, sentence) end
+  local bucket = math.floor(tonumber(sentence.previous_routing_bucket or sentence.previousRoutingBucket) or 0)
+  if bucket < 0 or type(SetPlayerRoutingBucket) ~= 'function' then return false, 'release_bucket_unavailable' end
+  SetPlayerRoutingBucket(identity.source, bucket)
   return true
 end
 
@@ -202,27 +236,173 @@ local function activityAllowed(sentenceId, job)
   return true
 end
 
-local function atIntakePoint(source)
+local function positionFor(source)
   if type(GetPlayerPed) ~= 'function' or type(GetEntityCoords) ~= 'function' then
-    return false, 'position_unavailable'
+    return nil, 'position_unavailable'
   end
   local ped = GetPlayerPed(source)
-  if not ped or ped <= 0 then return false, 'position_unavailable' end
+  if not ped or ped <= 0 then return nil, 'position_unavailable' end
   local position = GetEntityCoords(ped)
   local x, y, z = position and tonumber(position.x), position and tonumber(position.y), position and tonumber(position.z)
-  if not x or not y or not z then return false, 'position_unavailable' end
+  if not x or not y or not z then return nil, 'position_unavailable' end
   local bucket = type(GetPlayerRoutingBucket) == 'function' and GetPlayerRoutingBucket(source) or nil
-  for _, point in pairs(MZPrisonConfig.intakePoints) do
-    local coords = type(point) == 'table' and (point.coords or point) or nil
-    local px, py, pz = coords and tonumber(coords.x), coords and tonumber(coords.y), coords and tonumber(coords.z)
-    local radius = type(point) == 'table' and tonumber(point.radius) or nil
-    radius = radius or tonumber(MZPrisonConfig.intakeMaximumDistance) or 3.0
-    local pointBucket = type(point) == 'table' and tonumber(point.routingBucket) or nil
-    if px and py and pz and radius > 0 and radius <= 25
-      and (not pointBucket or bucket == pointBucket)
-      and ((x - px) ^ 2 + (y - py) ^ 2 + (z - pz) ^ 2) <= radius ^ 2 then return true end
+  if bucket == nil then return nil, 'position_unavailable' end
+  return { x = x, y = y, z = z, bucket = tonumber(bucket) }
+end
+
+local function pointContains(position, point, defaultRadius)
+  local coords = type(point) == 'table' and (point.coords or point) or nil
+  local px, py, pz = coords and tonumber(coords.x), coords and tonumber(coords.y), coords and tonumber(coords.z)
+  local radius = type(point) == 'table' and tonumber(point.radius) or nil
+  radius = radius or defaultRadius
+  local pointBucket = type(point) == 'table' and tonumber(point.routingBucket) or nil
+  return type(point) == 'table' and point.enabled == true and px and py and pz
+    and radius and radius > 0 and radius <= 25 and pointBucket and pointBucket >= 0
+    and pointBucket % 1 == 0 and position.bucket == pointBucket
+    and ((position.x - px) ^ 2 + (position.y - py) ^ 2 + (position.z - pz) ^ 2) <= radius ^ 2
+end
+
+local function configuredCell(facility)
+  local ids = {}
+  for id in pairs(type(facility.cells) == 'table' and facility.cells or {}) do ids[#ids + 1] = tostring(id) end
+  table.sort(ids)
+  for _, id in ipairs(ids) do
+    local cell = facility.cells[id]
+    local coords = type(cell) == 'table' and cell.coords or nil
+    if token(id, 2, 64, '^[a-z0-9_-]+$') and type(cell) == 'table' and cell.enabled == true
+      and type(coords) == 'table' and tonumber(coords.x) and tonumber(coords.y) and tonumber(coords.z) then
+      return { id = id, coords = { x = tonumber(coords.x), y = tonumber(coords.y), z = tonumber(coords.z) },
+        heading = tonumber(cell.heading) }
+    end
   end
-  return false, 'intake_point_required'
+end
+
+local function hasAllowedArea(facility)
+  for _, area in pairs(type(facility.allowedAreas) == 'table' and facility.allowedAreas or {}) do
+    local coords = type(area) == 'table' and (area.coords or area) or nil
+    local radius = type(area) == 'table' and tonumber(area.radius) or nil
+    if type(area) == 'table' and area.enabled == true and type(coords) == 'table'
+      and tonumber(coords.x) and tonumber(coords.y) and tonumber(coords.z)
+      and radius and radius > 0 then return true end
+  end
+  return false
+end
+
+local function intakeContext(actorSource, targetSource, orgCode)
+  local actor, actorError = positionFor(actorSource)
+  if not actor then return nil, actorError end
+  local target, targetError = positionFor(targetSource)
+  if not target then return nil, targetError end
+  if actor.bucket ~= target.bucket then return nil, 'routing_bucket_mismatch' end
+
+  local confinement = type(MZPrisonConfig.confinement) == 'table' and MZPrisonConfig.confinement or {}
+  if confinement.enabled == true then
+    local facilityIds = {}
+    for id in pairs(type(MZPrisonConfig.facilities) == 'table' and MZPrisonConfig.facilities or {}) do
+      facilityIds[#facilityIds + 1] = tostring(id)
+    end
+    table.sort(facilityIds)
+    for _, facilityId in ipairs(facilityIds) do
+      local facility = MZPrisonConfig.facilities[facilityId]
+      local facilityOrg = type(facility) == 'table' and token(facility.orgCode, 2, 64, '^[a-z0-9_-]+$') or nil
+      if type(facility) == 'table' and facility.enabled == true
+        and (not orgCode or facilityOrg == orgCode) then
+        local pointIds = {}
+        for pointId in pairs(type(facility.intakePoints) == 'table' and facility.intakePoints or {}) do
+          pointIds[#pointIds + 1] = tostring(pointId)
+        end
+        table.sort(pointIds)
+        for _, pointId in ipairs(pointIds) do
+          local point = facility.intakePoints[pointId]
+          if pointContains(actor, point, tonumber(MZPrisonConfig.intakeMaximumDistance) or 3.0)
+            and pointContains(target, point, tonumber(MZPrisonConfig.intakeMaximumDistance) or 3.0) then
+            local bucket = tonumber(facility.routingBucket)
+            local cell = configuredCell(facility)
+            if not bucket or bucket < 0 or bucket % 1 ~= 0 or not cell or not hasAllowedArea(facility) then
+              return nil, 'confinement_not_configured'
+            end
+            return {
+              facilityId = facilityId, intakePointId = pointId, cell = cell,
+              routingBucket = bucket, previousRoutingBucket = target.bucket
+            }
+          end
+        end
+      end
+    end
+    return nil, 'intake_point_required'
+  end
+
+  local pointIds = {}
+  for id in pairs(type(MZPrisonConfig.intakePoints) == 'table' and MZPrisonConfig.intakePoints or {}) do
+    pointIds[#pointIds + 1] = tostring(id)
+  end
+  table.sort(pointIds)
+  for _, pointId in ipairs(pointIds) do
+    local point = MZPrisonConfig.intakePoints[pointId]
+    local maximum = tonumber(MZPrisonConfig.intakeMaximumDistance) or 3.0
+    if pointContains(actor, point, maximum) and pointContains(target, point, maximum) then
+      return { intakePointId = pointId, previousRoutingBucket = target.bucket }
+    end
+  end
+  return nil, 'intake_point_required'
+end
+
+local function intakeConfigured()
+  local confinement = type(MZPrisonConfig.confinement) == 'table' and MZPrisonConfig.confinement or {}
+  if confinement.enabled == true then
+    return type(MZPrisonConfig.facilities) == 'table' and next(MZPrisonConfig.facilities) ~= nil
+  end
+  return MZPrisonConfig.intakeEnabled == true and type(MZPrisonConfig.intakePoints) == 'table'
+    and next(MZPrisonConfig.intakePoints) ~= nil
+end
+
+local function confinementFor(sentence)
+  local confinement = type(MZPrisonConfig.confinement) == 'table' and MZPrisonConfig.confinement or {}
+  if confinement.enabled ~= true then return nil end
+  local facilityId = tostring(sentence.facility_id or sentence.facilityId or '')
+  local cellId = tostring(sentence.cell_id or sentence.cellId or '')
+  local facility = type(MZPrisonConfig.facilities) == 'table' and MZPrisonConfig.facilities[facilityId] or nil
+  local cell = type(facility) == 'table' and type(facility.cells) == 'table' and facility.cells[cellId] or nil
+  local coords = type(cell) == 'table' and cell.coords or nil
+  local bucket = type(facility) == 'table' and tonumber(facility.routingBucket) or nil
+  if type(facility) ~= 'table' or facility.enabled ~= true or type(cell) ~= 'table' or cell.enabled ~= true
+    or not bucket or bucket < 0 or bucket % 1 ~= 0 or type(coords) ~= 'table'
+    or not tonumber(coords.x) or not tonumber(coords.y) or not tonumber(coords.z) then return nil end
+  return {
+    facilityId = facilityId, cellId = cellId, routingBucket = bucket,
+    coords = { x = tonumber(coords.x), y = tonumber(coords.y), z = tonumber(coords.z) },
+    heading = tonumber(cell.heading), allowedAreas = facility.allowedAreas
+  }
+end
+
+local function dispatchConfinement(identity, sentence)
+  local context = confinementFor(sentence)
+  if not context then return true end
+  if type(SetPlayerRoutingBucket) ~= 'function' or type(TriggerClientEvent) ~= 'function' then
+    return false, 'confinement_runtime_unavailable'
+  end
+  SetPlayerRoutingBucket(identity.source, context.routingBucket)
+  TriggerClientEvent('mz_prison:client:confinement', identity.source, {
+    sentenceId = sentence.public_id, facilityId = context.facilityId, cellId = context.cellId,
+    coords = context.coords, heading = context.heading
+  })
+  confinementCorrections[identity.source] = os.time()
+  return true
+end
+
+local function withinAllowedArea(source, context)
+  local position = positionFor(source)
+  if not position then return false, 'position_unavailable' end
+  if position.bucket ~= context.routingBucket then return false, 'routing_bucket_mismatch' end
+  for _, area in pairs(type(context.allowedAreas) == 'table' and context.allowedAreas or {}) do
+    local coords = type(area) == 'table' and (area.coords or area) or nil
+    local radius = type(area) == 'table' and tonumber(area.radius) or nil
+    if type(area) == 'table' and area.enabled == true and type(coords) == 'table' and radius and radius > 0
+      and tonumber(coords.x) and tonumber(coords.y) and tonumber(coords.z)
+      and ((position.x - tonumber(coords.x)) ^ 2 + (position.y - tonumber(coords.y)) ^ 2
+        + (position.z - tonumber(coords.z)) ^ 2) <= radius ^ 2 then return true end
+  end
+  return false, 'allowed_area_left'
 end
 
 local function releaseSentence(sentence, actor, operationId, requestFingerprint, action)
@@ -247,7 +427,10 @@ local function releaseSentence(sentence, actor, operationId, requestFingerprint,
     local targetSource = MZPrison.Bridge.getSource(sentence.target_citizenid)
     if targetSource then
       local identity = MZPrison.Bridge.resolveIdentity(targetSource)
-      if identity and identity.citizenid == tostring(sentence.target_citizenid) then dispatchRelease(identity, sentence) end
+      if identity and identity.citizenid == tostring(sentence.target_citizenid) then
+        restoreRoutingBucket(identity, sentence)
+        pushSentenceStatus(targetSource, sentence)
+      end
     end
     return true, sentenceResponse(sentence)
   end
@@ -260,6 +443,8 @@ local function releaseSentence(sentence, actor, operationId, requestFingerprint,
     return false, errorCode
   end
   local expectedProperty = MZPrison.Repository.listProperty(sentence.public_id)
+  local removed, uniformError = MZPrison.Bridge.removeUniform(targetSource, sentence.public_id)
+  if not removed then MZPrison.Repository.setError(sentence.public_id, uniformError); return false, uniformError end
   local restored, restoreError = MZPrison.Bridge.restoreProperty(targetSource, sentence.public_id, #expectedProperty)
   if not restored then MZPrison.Repository.setError(sentence.public_id, restoreError); return false, restoreError end
   local finishOperation = operationId .. ':property'
@@ -280,30 +465,67 @@ local function releaseSentence(sentence, actor, operationId, requestFingerprint,
     operationId = operationId, result = 'released', status = sentence.status,
     destinationId = destination and destination.id or nil
   })
-  dispatchRelease(targetIdentity, sentence)
+  pushSentenceStatus(targetSource, sentence)
+  local delivered, deliveryError = restoreRoutingBucket(targetIdentity, sentence)
+  if not delivered then MZPrison.Repository.setError(sentence.public_id, deliveryError) end
   return true, sentenceResponse(sentence)
 end
 
+local function activateSentence(sentence, actor, target, operationId)
+  if tostring(sentence.status) ~= 'intake_pending' then return sentence end
+  local retained, retainError = MZPrison.Bridge.retainProperty(target.source, sentence.public_id)
+  if not retained then
+    MZPrison.Repository.setError(sentence.public_id, retainError)
+    MZPrison.Bridge.audit('intake_failed', actor, sentence, {
+      operationId = operationId, result = 'pending', reason = retainError
+    })
+    return false, retainError
+  end
+  local uniform = type(MZPrisonConfig.uniform) == 'table' and MZPrisonConfig.uniform or {}
+  if uniform.enabled == true then
+    local dressed, uniformError = MZPrison.Bridge.applyUniform(
+      target.source, sentence.public_id, uniform.garments)
+    if not dressed then
+      MZPrison.Repository.setError(sentence.public_id, uniformError)
+      return false, uniformError
+    end
+  end
+  local propertyOperation = operationId .. ':property'
+  local propertyFingerprint = fingerprint(sentence.public_id, 'property_retained')
+  if not MZPrison.Repository.activateWithProperty(sentence.public_id, retained.items or {}, {
+    operationId = propertyOperation, requestFingerprint = propertyFingerprint,
+    sentenceId = sentence.public_id, action = 'property_retained', actorCitizenid = actor.citizenid,
+    details = { itemCount = #(retained.items or {}) }
+  }) then return false, 'persistence_failed' end
+  local updated = MZPrison.Repository.getById(sentence.public_id)
+  if not updated then return nil, 'persistence_failed' end
+  local confined, confinementError = dispatchConfinement(target, updated)
+  if not confined then
+    MZPrison.Repository.setError(sentence.public_id, confinementError)
+    return false, confinementError
+  end
+  pushSentenceStatus(target.source, updated)
+  return updated
+end
+
 function Service.requestSentence(actorSource, targetSource, request)
+  if not available() then return false, 'prison_unavailable' end
   if not closed(request, {
     chargeId = true, ruleCode = true, ruleName = true, sentenceSeconds = true,
     legalVersion = true, caseId = true, operationId = true, orgCode = true
   }) then
     return false, 'invalid_request'
   end
-  if MZPrisonConfig.intakeEnabled ~= true or type(MZPrisonConfig.intakePoints) ~= 'table'
-    or next(MZPrisonConfig.intakePoints) == nil then return false, 'intake_not_configured' end
+  if not intakeConfigured() then return false, 'intake_not_configured' end
   local actor, actorError = MZPrison.Bridge.resolveIdentity(actorSource)
   if not actor then return false, actorError end
   local target, targetError = MZPrison.Bridge.resolveIdentity(targetSource)
   if not target then return false, targetError end
   if actor.citizenid == target.citizenid then return false, 'self_sentence_forbidden' end
-  local atPoint, pointError = atIntakePoint(target.source)
-  if not atPoint then return false, pointError end
   local orgCode = token(request.orgCode, 2, 64, '^[a-z0-9_-]+$')
   local caseId = token(request.caseId, 8, 160)
   local chargeId = token(request.chargeId, 8, 160)
-  local operationId = token(request.operationId, 16, 64, '^[%w_-]+$')
+  local operationId = token(request.operationId, 16, 64, '^[%w:_-]+$')
   local ruleName = trim(request.ruleName)
   local legalVersion = trim(request.legalVersion)
   local sentenceSeconds = tonumber(request.sentenceSeconds)
@@ -313,6 +535,8 @@ function Service.requestSentence(actorSource, targetSource, request)
     or not sentenceSeconds or sentenceSeconds <= 0 then
     return false, 'invalid_request'
   end
+  local intake, pointError = intakeContext(actor.source, target.source, orgCode)
+  if not intake then return false, pointError end
   local sentenceRule, ruleError = rule('sentenceRules', orgCode, request.ruleCode)
   if not sentenceRule then return false, ruleError end
   if sentenceRule.name ~= ruleName or sentenceRule.seconds ~= sentenceSeconds
@@ -334,12 +558,19 @@ function Service.requestSentence(actorSource, targetSource, request)
       if tostring(sentence.target_citizenid) ~= target.citizenid then return false, 'operation_id_conflict' end
     else
       if MZPrison.Repository.getCurrent(target.citizenid) then return false, 'active_sentence_exists' end
+      if MZPrison.Repository.getChargeSentence
+        and MZPrison.Repository.getChargeSentence(chargeId) then
+        return false, 'charge_already_sentenced'
+      end
       local created = MZPrison.Repository.createSentence({
         publicId = publicId, operationId = operationId, targetCitizenid = target.citizenid,
         caseId = caseId, chargeId = chargeId, orgCode = orgCode,
         ruleCode = sentenceRule.code, ruleName = ruleName,
         legalVersion = legalVersion, durationSeconds = sentenceSeconds,
         clockMode = MZPrisonConfig.clockMode, actorCitizenid = actor.citizenid,
+        facilityId = intake.facilityId, intakePointId = intake.intakePointId,
+        cellId = intake.cell and intake.cell.id or nil,
+        previousRoutingBucket = intake.previousRoutingBucket,
         history = {
           operationId = operationId, requestFingerprint = requestFingerprint,
           sentenceId = publicId, action = 'sentence_created', actorCitizenid = actor.citizenid,
@@ -349,28 +580,143 @@ function Service.requestSentence(actorSource, targetSource, request)
       if not created then return false, 'persistence_failed' end
       sentence = MZPrison.Repository.getById(publicId)
     end
-    if tostring(sentence.status) == 'intake_pending' then
-      local retained, retainError = MZPrison.Bridge.retainProperty(target.source, publicId)
-      if not retained then
-        MZPrison.Repository.setError(publicId, retainError)
-        MZPrison.Bridge.audit('intake_failed', actor, sentence, { operationId = operationId, result = 'pending', reason = retainError })
-        return false, retainError
-      end
-      local propertyOperation = operationId .. ':property'
-      local propertyFingerprint = fingerprint(publicId, 'property_retained')
-      if not MZPrison.Repository.activateWithProperty(publicId, retained.items or {}, {
-        operationId = propertyOperation, requestFingerprint = propertyFingerprint,
-        sentenceId = publicId, action = 'property_retained', actorCitizenid = actor.citizenid,
-        details = { itemCount = #(retained.items or {}) }
-      }) then return false, 'persistence_failed' end
-      sentence = MZPrison.Repository.getById(publicId)
-    end
+    local activated, activationError = activateSentence(sentence, actor, target, operationId)
+    if not activated then return false, activationError end
+    sentence = activated
     MZPrison.Bridge.audit('sentence_started', actor, sentence, { operationId = operationId, result = 'active', status = sentence.status })
     return true, sentenceResponse(sentence)
   end)
 end
 
+function Service.requestSentenceFromCharges(actorSource, targetSource, request)
+  if not available() then return false, 'prison_unavailable' end
+  if not closed(request, {
+    caseId = true, primaryChargeId = true, charges = true, operationId = true, orgCode = true
+  }) then return false, 'invalid_request' end
+
+  local multi = type(MZPrisonConfig.multiCharge) == 'table' and MZPrisonConfig.multiCharge or {}
+  if multi.enabled ~= true then return false, 'multi_charge_disabled' end
+  if tostring(multi.aggregation or '') ~= 'sum' then return false, 'aggregation_policy_not_supported' end
+  if not intakeConfigured() then return false, 'intake_not_configured' end
+
+  local actor, actorError = MZPrison.Bridge.resolveIdentity(actorSource)
+  if not actor then return false, actorError end
+  local target, targetError = MZPrison.Bridge.resolveIdentity(targetSource)
+  if not target then return false, targetError end
+  if actor.citizenid == target.citizenid then return false, 'self_sentence_forbidden' end
+  local orgCode = token(request.orgCode, 2, 64, '^[a-z0-9_-]+$')
+  local caseId = token(request.caseId, 8, 160)
+  local primaryChargeId = token(request.primaryChargeId, 8, 160)
+  local operationId = token(request.operationId, 16, 64, '^[%w:_-]+$')
+  local maximum = math.max(1, math.floor(tonumber(multi.maximumCharges) or 1))
+  if not orgCode or not caseId or not primaryChargeId or not operationId
+    or type(request.charges) ~= 'table' or #request.charges < 1 or #request.charges > maximum then
+    return false, 'invalid_charge_count'
+  end
+  local intake, pointError = intakeContext(actor.source, target.source, orgCode)
+  if not intake then return false, pointError end
+
+  local legalVersion = trim(MZPrisonConfig.legalVersion)
+  if legalVersion == '' then return false, 'invalid_legal_version' end
+  local charges, seen, sortedIds = {}, {}, {}
+  local total = 0
+  for _, raw in ipairs(request.charges) do
+    if not closed(raw, {
+      chargeId = true, ruleCode = true, ruleName = true, sentenceSeconds = true, legalVersion = true
+    }) then return false, 'invalid_request' end
+    local chargeId = token(raw.chargeId, 8, 160)
+    local ruleCode = token(raw.ruleCode, 2, 64, '^[%w:_-]+$')
+    local ruleName = trim(raw.ruleName)
+    local seconds = tonumber(raw.sentenceSeconds)
+    local version = trim(raw.legalVersion)
+    if not chargeId or seen[chargeId] or not ruleCode or ruleName == '' or #ruleName > 160
+      or not seconds or seconds <= 0 or seconds % 1 ~= 0 or version == '' or version ~= legalVersion then
+      return false, 'invalid_request'
+    end
+    local sentenceRule, ruleError = rule('sentenceRules', orgCode, ruleCode)
+    if not sentenceRule then return false, ruleError end
+    if sentenceRule.name ~= ruleName or sentenceRule.seconds ~= seconds
+      or tostring(MZPrisonConfig.legalVersion or '') ~= version then
+      return false, 'sentence_rule_mismatch'
+    end
+    seen[chargeId] = true
+    total = total + seconds
+    sortedIds[#sortedIds + 1] = chargeId
+    charges[#charges + 1] = {
+      chargeId = chargeId, ruleCode = sentenceRule.code, ruleName = ruleName,
+      sentenceSeconds = seconds, legalVersion = version
+    }
+  end
+  if not seen[primaryChargeId] then return false, 'invalid_primary_charge' end
+  local maximumSentence = math.floor(tonumber(multi.maximumSentenceSeconds) or 0)
+  if #charges > 1 and maximumSentence <= 0 then return false, 'sentence_cap_not_configured' end
+  if maximumSentence > 0 and total > maximumSentence then return false, 'sentence_limit_exceeded' end
+  if MZPrisonConfig.clockMode ~= 'online' then return false, 'clock_mode_not_supported' end
+
+  table.sort(sortedIds)
+  local primary
+  for _, charge in ipairs(charges) do
+    if charge.chargeId == primaryChargeId then primary = charge; break end
+  end
+  if not primary then return false, 'invalid_primary_charge' end
+
+  local requestFingerprint = fingerprint(
+    actor.citizenid, target.citizenid, orgCode, caseId, primaryChargeId,
+    table.concat(sortedIds, ','), total, legalVersion
+  )
+  local publicId = 'sentence:' .. operationId
+
+  return withLock('citizen:' .. target.citizenid, function()
+    local sentence = MZPrison.Repository.getByOperation(operationId)
+    if sentence then
+      local replayed, replayError = historyReplay(operationId, requestFingerprint)
+      if replayed == nil then return false, replayError end
+      if tostring(sentence.target_citizenid) ~= target.citizenid then return false, 'operation_id_conflict' end
+    else
+      if MZPrison.Repository.getCurrent(target.citizenid) then return false, 'active_sentence_exists' end
+      if MZPrison.Repository.getChargeSentence then
+        for _, charge in ipairs(charges) do
+          if MZPrison.Repository.getChargeSentence(charge.chargeId) then
+            return false, 'charge_already_sentenced'
+          end
+        end
+      end
+
+      local created = MZPrison.Repository.createSentenceWithCharges({
+        publicId = publicId, operationId = operationId, targetCitizenid = target.citizenid,
+        caseId = caseId, primaryChargeId = primaryChargeId, orgCode = orgCode,
+        ruleCode = primary.ruleCode, ruleName = primary.ruleName, legalVersion = legalVersion,
+        durationSeconds = total, clockMode = MZPrisonConfig.clockMode, actorCitizenid = actor.citizenid,
+        facilityId = intake.facilityId, intakePointId = intake.intakePointId,
+        cellId = intake.cell and intake.cell.id or nil,
+        previousRoutingBucket = intake.previousRoutingBucket,
+        charges = charges,
+        history = {
+          operationId = operationId, requestFingerprint = requestFingerprint,
+          sentenceId = publicId, action = 'sentence_created', actorCitizenid = actor.citizenid,
+          details = {
+            chargeIds = sortedIds, chargeCount = #charges,
+            durationSeconds = total, aggregation = 'sum'
+          }
+        }
+      })
+      if not created then return false, 'persistence_failed' end
+      sentence = MZPrison.Repository.getById(publicId)
+      if not sentence then return false, 'persistence_failed' end
+    end
+
+    local activated, activationError = activateSentence(sentence, actor, target, operationId)
+    if not activated then return false, activationError end
+    sentence = activated
+    MZPrison.Bridge.audit('sentence_started', actor, sentence, {
+      operationId = operationId, result = 'active', status = sentence.status, chargeCount = #charges
+    })
+    return true, sentenceResponse(sentence)
+  end)
+end
+
 function Service.getSentence(citizenid)
+  if not available() then return false, 'prison_unavailable' end
   citizenid = token(citizenid, 2, 64)
   if not citizenid then return false, 'invalid_citizenid' end
   local character, characterError = MZPrison.Bridge.getCharacter(citizenid)
@@ -380,12 +726,13 @@ function Service.getSentence(citizenid)
 end
 
 function Service.reduceSentence(actorSource, citizenid, request)
+  if not available() then return false, 'prison_unavailable' end
   if not closed(request, { ruleCode = true, operationId = true, orgCode = true }) then return false, 'invalid_request' end
   local actor, actorError = MZPrison.Bridge.resolveIdentity(actorSource)
   if not actor then return false, actorError end
   citizenid = token(citizenid, 2, 64)
   local orgCode = token(request.orgCode, 2, 64, '^[a-z0-9_-]+$')
-  local operationId = token(request.operationId, 16, 64, '^[%w_-]+$')
+  local operationId = token(request.operationId, 16, 64, '^[%w:_-]+$')
   if not citizenid or not orgCode or not operationId then return false, 'invalid_request' end
   local reduction, ruleError = rule('reductionRules', orgCode, request.ruleCode)
   if not reduction then return false, ruleError end
@@ -422,13 +769,14 @@ function Service.reduceSentence(actorSource, citizenid, request)
 end
 
 function Service.releasePrisoner(actorSource, citizenid, request)
+  if not available() then return false, 'prison_unavailable' end
   if not closed(request, { reasonCode = true, operationId = true, orgCode = true }) then return false, 'invalid_request' end
   if MZPrisonConfig.manualReleaseEnabled ~= true then return false, 'manual_release_disabled' end
   local actor, actorError = MZPrison.Bridge.resolveIdentity(actorSource)
   if not actor then return false, actorError end
   citizenid = token(citizenid, 2, 64)
   local orgCode = token(request.orgCode, 2, 64, '^[a-z0-9_-]+$')
-  local operationId = token(request.operationId, 16, 64, '^[%w_-]+$')
+  local operationId = token(request.operationId, 16, 64, '^[%w:_-]+$')
   local reasonCode = token(request.reasonCode, 2, 64, '^[a-z0-9_-]+$')
   local reason = reasonCode and type(MZPrisonConfig.manualReleaseReasons) == 'table'
     and MZPrisonConfig.manualReleaseReasons[reasonCode] or nil
@@ -456,6 +804,7 @@ function Service.releasePrisoner(actorSource, citizenid, request)
 end
 
 function Service.startActivity(source, request)
+  if not available() then return false, 'prison_unavailable' end
   if not closed(request, { jobCode = true, pointId = true, requestId = true }) then return false, 'invalid_request' end
   if MZPrisonConfig.jobsEnabled ~= true then return false, 'activities_disabled' end
   local rateOk, rateError = activityRateAllowed(source)
@@ -508,6 +857,7 @@ function Service.startActivity(source, request)
 end
 
 function Service.completeActivity(source, request)
+  if not available() then return false, 'prison_unavailable' end
   if not closed(request, { activityId = true, requestId = true }) then return false, 'invalid_request' end
   if MZPrisonConfig.jobsEnabled ~= true then return false, 'activities_disabled' end
   local rateOk, rateError = activityRateAllowed(source)
@@ -568,6 +918,7 @@ function Service.completeActivity(source, request)
 end
 
 function Service.acknowledgeRelease(source, request)
+  if not available() then return false, 'prison_unavailable' end
   if not closed(request, { sentenceId = true, destinationId = true }) then return false, 'invalid_request' end
   local identity, identityError = MZPrison.Bridge.resolveIdentity(source)
   if not identity then return false, identityError end
@@ -610,7 +961,40 @@ function Service.acknowledgeRelease(source, request)
   end)
 end
 
+function Service.acknowledgeConfinement(source, request)
+  if not available() then return false, 'prison_unavailable' end
+  if not closed(request, { sentenceId = true, facilityId = true, cellId = true }) then
+    return false, 'invalid_request'
+  end
+  local identity, identityError = MZPrison.Bridge.resolveIdentity(source)
+  if not identity then return false, identityError end
+  local sentenceId = token(request.sentenceId, 8, 96)
+  local facilityId = token(request.facilityId, 2, 64, '^[a-z0-9_-]+$')
+  local cellId = token(request.cellId, 2, 64, '^[a-z0-9_-]+$')
+  if not sentenceId or not facilityId or not cellId then return false, 'invalid_request' end
+  local sentence = MZPrison.Repository.getById(sentenceId)
+  local context = sentence and confinementFor(sentence) or nil
+  if not sentence or tostring(sentence.status) ~= 'active'
+    or tostring(sentence.target_citizenid) ~= identity.citizenid or not context
+    or context.facilityId ~= facilityId or context.cellId ~= cellId then
+    return false, 'confinement_not_found'
+  end
+  local position = positionFor(source)
+  if not position or position.bucket ~= context.routingBucket
+    or ((position.x - context.coords.x) ^ 2 + (position.y - context.coords.y) ^ 2
+      + (position.z - context.coords.z) ^ 2) > 25 then return false, 'confinement_not_reached' end
+  if tostring(sentence.confinement_status or '') ~= 'confirmed'
+    and not MZPrison.Repository.markConfinement(sentenceId, 'confirmed') then
+    return false, 'persistence_failed'
+  end
+  MZPrison.Bridge.audit('confinement_confirmed', identity, sentence, {
+    result = 'confirmed', status = 'active'
+  })
+  return true
+end
+
 function Service.resumeSource(source)
+  if not available() then return false, 'prison_unavailable' end
   local identity, identityError = MZPrison.Bridge.resolveIdentity(source)
   if not identity then return false, identityError end
   local sentence = MZPrison.Repository.getCurrent(identity.citizenid)
@@ -635,6 +1019,15 @@ function Service.resumeSource(source)
       })
     end
   end
+  if sentence and tostring(sentence.status) == 'active' then
+    local confined, confinementError = dispatchConfinement(identity, sentence)
+    if not confined then return false, confinementError end
+    pushSentenceStatus(identity.source, sentence)
+    local settings = type(MZPrisonConfig.confinement) == 'table' and MZPrisonConfig.confinement or {}
+    local grace = math.max(0, math.floor(tonumber(settings.resumeGraceSeconds) or 0))
+    local cooldown = math.max(1, math.floor(tonumber(settings.correctionCooldownSeconds) or 10))
+    confinementCorrections[identity.source] = os.time() + math.max(0, grace - cooldown)
+  end
   if MZPrison.Repository.getPendingReleaseDelivery then
     local delivery = MZPrison.Repository.getPendingReleaseDelivery(identity.citizenid)
     if delivery then
@@ -646,6 +1039,7 @@ function Service.resumeSource(source)
 end
 
 function Service.tickOnce()
+  if not available() then return false, 'prison_unavailable' end
   local seconds = math.max(1, math.floor(tonumber(MZPrisonConfig.tickSeconds) or 30))
   for _, candidate in ipairs(MZPrison.Repository.listPending()) do
     withLock('citizen:' .. tostring(candidate.target_citizenid), function()
@@ -653,7 +1047,29 @@ function Service.tickOnce()
       if not sentence then return false end
       if tostring(sentence.status) == 'active' then
         local source = MZPrison.Bridge.getSource(sentence.target_citizenid)
-        if source then sentence = MZPrison.Repository.tick(sentence.public_id, seconds) end
+        if source then
+          sentence = MZPrison.Repository.tick(sentence.public_id, seconds)
+          if sentence then pushSentenceStatus(source, sentence) end
+          local context = sentence and confinementFor(sentence) or nil
+          local cooldown = math.max(1, math.floor(tonumber(
+            type(MZPrisonConfig.confinement) == 'table'
+              and MZPrisonConfig.confinement.correctionCooldownSeconds) or 10))
+          local inside, correctionReason
+          if context then inside, correctionReason = withinAllowedArea(source, context) end
+          local death = context and MZPrison.Bridge.getDeathState(source) or nil
+          if context and inside == false and type(death) == 'table' and death.deathState == 'alive'
+            and os.time() - tonumber(confinementCorrections[source] or 0) >= cooldown then
+            local identity = MZPrison.Bridge.resolveIdentity(source)
+            if identity and identity.citizenid == tostring(sentence.target_citizenid) then
+              local corrected = dispatchConfinement(identity, sentence)
+              if corrected then
+                MZPrison.Bridge.audit('confinement_corrected', identity, sentence, {
+                  result = 'corrected', status = 'active', reason = correctionReason
+                })
+              end
+            end
+          end
+        end
       end
       if sentence and tostring(sentence.status) == 'release_pending' then
         local pending = MZPrison.Repository.getPendingReleaseHistory
@@ -670,7 +1086,47 @@ function Service.tickOnce()
   end
 end
 
-function Service.cleanupSource(source) activityRates[tonumber(source)] = nil end
-function Service.stop() locks, activityRates = {}, {} end
+function Service.validateConfiguration()
+  local multi = type(MZPrisonConfig.multiCharge) == 'table' and MZPrisonConfig.multiCharge or {}
+  if multi.enabled == true then
+    local maximum = math.floor(tonumber(multi.maximumCharges) or 0)
+    local cap = math.floor(tonumber(multi.maximumSentenceSeconds) or 0)
+    if maximum < 1 or maximum > 8 or cap <= 0 then return false, 'multi_charge_policy_incomplete' end
+  end
+  local uniform = type(MZPrisonConfig.uniform) == 'table' and MZPrisonConfig.uniform or {}
+  if uniform.enabled == true and (type(uniform.garments) ~= 'table' or #uniform.garments < 1) then
+    return false, 'prison_uniform_not_configured'
+  end
+  local confinement = type(MZPrisonConfig.confinement) == 'table' and MZPrisonConfig.confinement or {}
+  if confinement.enabled ~= true then return true end
+  local found = false
+  for facilityId, facility in pairs(type(MZPrisonConfig.facilities) == 'table' and MZPrisonConfig.facilities or {}) do
+    if type(facility) == 'table' and facility.enabled == true then
+      found = true
+      local bucket = tonumber(facility.routingBucket)
+      local orgCode = token(facility.orgCode, 2, 64, '^[a-z0-9_-]+$')
+      local intakeFound = false
+      for _, point in pairs(type(facility.intakePoints) == 'table' and facility.intakePoints or {}) do
+        local coords = type(point) == 'table' and (point.coords or point) or nil
+        if type(point) == 'table' and point.enabled == true and type(coords) == 'table'
+          and tonumber(coords.x) and tonumber(coords.y) and tonumber(coords.z)
+          and tonumber(point.radius) and tonumber(point.routingBucket) then intakeFound = true; break end
+      end
+      if not token(facilityId, 2, 64, '^[a-z0-9_-]+$') or not orgCode or not bucket
+        or bucket < 0 or bucket % 1 ~= 0 or not intakeFound
+        or not configuredCell(facility) or not hasAllowedArea(facility) then
+        return false, 'facility_invalid:' .. tostring(facilityId)
+      end
+    end
+  end
+  if found then return true end
+  return false, 'confinement_not_configured'
+end
+
+function Service.cleanupSource(source)
+  source = tonumber(source)
+  activityRates[source], confinementCorrections[source] = nil, nil
+end
+function Service.stop() locks, activityRates, confinementCorrections = {}, {}, {} end
 
 MZPrison.Service = Service

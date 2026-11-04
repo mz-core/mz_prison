@@ -6,6 +6,15 @@ local sentence = {
 local histories, delivery = {}, nil
 local restoreCalls, finishCalls, markCalls, expectedCount, events, buckets = 0, 0, 0, nil, {}, {}
 local restoreFailure = true
+
+local function countEvents(name)
+  local count = 0
+  for _, event in ipairs(events) do if event.name == name then count = count + 1 end end
+  return count
+end
+local function lastEvent(name)
+  for index = #events, 1, -1 do if events[index].name == name then return events[index] end end
+end
 local atExit = true
 
 MZPrisonConfig = {
@@ -28,6 +37,7 @@ function GetEntityCoords()
 end
 
 MZPrison = {
+  Prepare = { ready = true },
   Bridge = {
     resolveIdentity = function(source)
       if source == 1 then return { source = 1, sessionId = 11, characterId = 111, citizenid = 'OFFICER1', active = true } end
@@ -41,6 +51,7 @@ MZPrison = {
       if restoreFailure then return nil, 'inventory_busy' end
       return { sentenceId = sentenceId, items = { { item = 'phone' } }, replayed = restoreCalls > 2 }
     end,
+    removeUniform = function() return {} end,
     audit = function() return true end
   },
   Repository = {
@@ -107,13 +118,15 @@ restoreFailure = false
 MZPrison.Service.tickOnce()
 expect(sentence.status == 'released' and sentence.property_status == 'restored'
   and restoreCalls == 2 and finishCalls == 1, 'retomada nao concluiu devolucao/soltura')
-expect(delivery and delivery.status == 'pending' and #events == 1
-  and events[1].payload.destinationId == 'exit_a' and buckets[1].value == 0,
+local releaseEvent = lastEvent('mz_prison:client:release')
+expect(delivery and delivery.status == 'pending' and releaseEvent
+  and releaseEvent.payload.destinationId == 'exit_a' and buckets[1].value == 0,
   'destino configurado nao foi despachado pelo servidor')
 
+local beforeResumeRelease = countEvents('mz_prison:client:release')
 local resumedOk = MZPrison.Service.resumeSource(4)
-expect(resumedOk == true and #events == 2 and restoreCalls == 2,
-  'reconnect nao retomou destino pendente ou repetiu devolucao')
+expect(resumedOk == true and countEvents('mz_prison:client:release') == beforeResumeRelease + 1
+  and restoreCalls == 2, 'reconnect nao retomou destino pendente ou repetiu devolucao')
 
 atExit = false
 local distantOk, distantError = MZPrison.Service.acknowledgeRelease(4, {
